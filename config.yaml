@@ -1,0 +1,35 @@
+# config.yaml
+scraping:
+  headless: true
+  concurrency_limit: 3
+  timeout_ms: 30000
+  targets:
+    - platform: "facebook_marketplace"
+      base_url: "https://www.facebook.com/marketplace/toronto/cars/"
+    - platform: "kijiji"
+      base_url: "https://www.kijiji.ca/b-cars-trucks/gta-greater-toronto-area/"
+
+ml_pipeline:
+  embeddings:
+    # Lightweight, lightning-fast embedding model perfect for short vehicle strings
+    model_name: "all-MiniLM-L6-v2" 
+    batch_size: 32
+  
+  clustering:
+    algorithm: "bisecting_kmeans"
+    # Starting guess for K, algorithm will optimize based on bisecting strategy
+    initial_k: 100 
+    bisecting_strategy: "biggest_inertia"
+    random_state: 42
+
+  llm_labeling:
+    provider: "openai" # or "gemini"
+    model: "gpt-4-turbo"
+    temperature: 0.1
+    samples_per_cluster: 5
+    prompt_template: >
+      You are an expert automotive taxonomist. 
+      Review the following {samples_per_cluster} messy marketplace listing titles. 
+      They all represent the exact same car model.
+      Return ONLY the canonical Year, Make, Model, and Trim (if applicable).
+      Example: "2015 Honda Civic LX"
