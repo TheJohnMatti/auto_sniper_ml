@@ -22,11 +22,14 @@ class MarketplaceScraper:
         )
         self.scraped_data = []
 
-    async def _scroll_page(self, page: Page, scrolls: int = 5):
+    async def _scroll_page(self, page: Page, scrolls: int = 3):
         """
         Handles infinite scrolling to trigger lazy-loaded listings.
+        NOTE: Kept to 3 scrolls maximum. Facebook prompts unauthenticated 
+        users with a hard login wall after exactly 100 listings. 
+        3 scrolls * ~24 listings/scroll = ~75-90 listings (Safe Zone).
         """
-        print(f"[*] Scrolling page {scrolls} times to load content...")
+        print(f"[*] Scrolling page {scrolls} times to load content (Avoiding 100-post login wall)...")
         for i in range(scrolls):
             # Using mouse wheel is often more reliable for React virtualized lists like FB
             await page.mouse.wheel(0, 4000)
@@ -133,9 +136,6 @@ class MarketplaceScraper:
                 await asyncio.sleep(1)
             # ----------------------
             
-            # Optional: Add a pause here if you need to manually log in to Facebook
-            # await page.pause() 
-            
             await self._scroll_page(page, scrolls=3)
             await self._extract_listings(page)
             
@@ -144,24 +144,23 @@ class MarketplaceScraper:
 
 
 async def main():
-    # Massive list of Canadian cities to scrape for comprehensive training data
+    # Curated list of validated, uniquely Canadian cities
     cities = [
-        # Ontario
-        "toronto", "ottawa", "mississauga", "hamilton", "london", 
-        "kitchener", "waterloo", "windsor", "sudbury", "oshawa", 
-        "barrie", "stcatharines", "guelph", "kingston", "thunderbay", 
-        "brantford", "peterborough", "niagarafalls",
-        # British Columbia
-        "vancouver", "victoria", "kelowna", "nanaimo", "kamloops", "abbotsford",
-        # Alberta
-        "calgary", "edmonton", "reddeer", "lethbridge", "medicinehat",
-        # Saskatchewan & Manitoba
-        "saskatoon", "regina", "winnipeg",
-        # Quebec (Note: FB usually resolves standard english names, but using local slugs helps)
-        "montreal", "quebec", "laval", "gatineau", "sherbrooke", "troisrivieres",
-        # Maritimes & Newfoundland
-        "halifax", "dartmouth", "sydney", "moncton", "saintjohn", 
-        "fredericton", "charlottetown", "stjohns"
+        "toronto",
+        "ottawa",
+        "hamilton", 
+        "windsor",
+        "vancouver",
+        "victoria", # Added back in
+        "nanaimo",
+        "calgary",
+        "edmonton",
+        "saskatoon",
+        "regina",
+        "winnipeg",
+        "montreal",
+        "quebec",
+        "halifax"
     ]
     
     # Define platform-specific configurations
@@ -173,13 +172,6 @@ async def main():
                 "card": "[data-virtualized='false']"
             }
         }
-        # "kijiji": {
-        #     "url_template": "https://www.kijiji.ca/b-cars-trucks/{city}/c174l1700272", # Simplified example
-        #     "selectors": {
-        #         "card": "YOUR_KIJIJI_CARD_SELECTOR",
-        #         ...
-        #     }
-        # }
     }
 
     # You can comment out platforms here to test them one by one
