@@ -23,14 +23,9 @@ ml_pipeline:
     bisecting_strategy: "biggest_inertia"
     random_state: 42
 
-  llm_labeling:
-    provider: "openai" # or "gemini"
-    model: "gpt-4-turbo"
-    temperature: 0.1
-    samples_per_cluster: 5
-    prompt_template: >
-      You are an expert automotive taxonomist. 
-      Review the following {samples_per_cluster} messy marketplace listing titles. 
-      They all represent the exact same car model.
-      Return ONLY the canonical Year, Make, Model, and Trim (if applicable).
-      Example: "2015 Honda Civic LX"
+  labeling:
+    # No external API. run_pipeline writes centroid samples to
+    # data/clusters/label_requests.json; the `label-clusters` skill (invoked by
+    # the agent) turns them into data/clusters/label_map.json. Clusters without a
+    # curated label fall back to a deterministic token-frequency heuristic.
+    samples_per_cluster: 10

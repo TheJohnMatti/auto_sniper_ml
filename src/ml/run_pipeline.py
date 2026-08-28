@@ -1,12 +1,18 @@
 """
 Phase 1 orchestrator: raw scrape CSVs -> entity-resolved, labeled listings.
 
-    python src/ml/run_pipeline.py
+    python -m src.ml.run_pipeline
+
+Cluster labeling has no external API. The first run writes centroid samples to
+data/clusters/label_requests.json and labels every cluster with the deterministic
+heuristic. Invoke the `label-clusters` skill to turn those samples into
+data/clusters/label_map.json, then run this again to fold the curated labels in.
 
 Outputs:
     data/processed/listings_labeled.csv   one row per unique listing + cluster + entity_id/entity_label
     data/processed/listings_labeled.pkl   same, with pandas dtypes preserved for Phase 2
     data/clusters/cluster_labels.csv      one row per model cluster (label, size, method, samples)
+    data/clusters/label_requests.json     centroid samples for the labeling skill
 """
 import os
 
@@ -14,7 +20,7 @@ import pandas as pd
 
 from src.ml.cluster import cluster_embeddings
 from src.ml.embed import embed_titles
-from src.ml.label import label_clusters
+from src.ml.label import LABEL_MAP_PATH, resolve_labels, write_label_requests
 from src.ml.load_data import load_raw_listings
 
 PROCESSED_DIR = "data/processed"
@@ -34,7 +40,10 @@ def main() -> None:
     result = cluster_embeddings(embeddings)
     df = df.assign(cluster=result.labels)
 
-    cluster_df = label_clusters(df, embeddings, result.labels, result.centroids)
+    requests_path = write_label_requests(df, embeddings, result.labels, result.centroids)
+    print(f"[+] Wrote {requests_path} ({result.k} clusters)")
+
+    cluster_df = resolve_labels(df, embeddings, result.labels, result.centroids)
     label_map = dict(zip(cluster_df["cluster"], cluster_df["canonical_label"]))
     df["canonical_label"] = df["cluster"].map(label_map)
 
@@ -59,6 +68,9 @@ def main() -> None:
     print(f"[+] Wrote {clusters_path}")
     print(f"\n[+] {df['entity_id'].nunique()} distinct entities "
           f"({result.k} model clusters x parsed year)")
+    if not os.path.exists(LABEL_MAP_PATH):
+        print(f"[i] No {LABEL_MAP_PATH} yet - labels are all heuristic. "
+              f"Invoke the `label-clusters` skill, then re-run.")
     print("\nTop entities by listing count:")
     top = (
         df.groupby("entity_label")
