@@ -99,15 +99,17 @@ are the remaining TODO.
 7. **Scrape descriptions & score them** (Phase 2b, optional but recommended):
 
    ```bash
-   poetry run python -m src.scraper.fetch_descriptions --deals   # candidates first
-   poetry run python -m src.scraper.fetch_descriptions           # then the rest, 150/run
-   poetry run python -m src.ml.sentiment
-   poetry run python -m src.ml.valuation                         # re-run to fold signals in
+   poetry run python -m src.scraper.fetch_descriptions --deals            # candidates first
+   pwsh scripts/backfill_descriptions.ps1 -Since <YYYYMMDD> -RunSentiment  # backfill the rest
    ```
 
-   `fetch_descriptions` is resumable — it appends to `data/raw/descriptions.csv`
-   and skips listings it already has. Batch size is `scraping.description_batch_size`.
-   `sentiment` writes `data/processed/listing_signals.csv`.
+   `fetch_descriptions` is resumable — it appends to `data/raw/descriptions.csv`,
+   skips listings it already has, and fetches `--concurrency` pages at once
+   (default `scraping.concurrency_limit`; keep it 2–3, unauthenticated). `--since`
+   limits it to recent scrapes (older listings are mostly sold). The backfill
+   script loops it in spaced batches until the queue drains, then runs
+   `sentiment` (→ `data/processed/listing_signals.csv`) and re-runs `valuation`
+   to fold the signals into `deal_score`.
 
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
