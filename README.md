@@ -23,9 +23,39 @@ price distribution per year+model entity** (median + MAD, not mean/std — marke
 prices are heavy-tailed and full of scams/parts/typos). Each listing gets a
 leave-one-out robust z-score against its entity's other comps. Listings are
 flagged as **deals** when they clear the z-score, a minimum discount %, and are
-not so cheap they're almost certainly junk (**suspect**). Mileage-based
-depreciation and push notifications are still TODO — mileage needs the
-description scrape first.
+not so cheap they're almost certainly junk (**suspect**).
+
+**Mileage adjustment (`src/ml/mileage.py`):** a 300 000 km car and a 90 000 km
+car of the same year+model aren't comparable, so the high-km one looks like a
+steal. The module fits one pooled, robust (median-of-pairwise-slopes)
+depreciation curve — `log(price) ≈ entity_effect + β·km`, currently ≈ **−3×10⁻⁶
+log$/km (~27 % per 100 000 km)** — and restates every price to a 120 000 km
+reference before scoring. Cars with no / implausible odometer are held at their
+entity's median odometer (i.e. barely moved).
+
+**Outlier filter ("too good to be true"):** free/$1 BMWs whose description is
+really "make me an offer", finance-payment ads (`$281 bi-weekly`), lease
+buy-ins and rental deposits all read as enormous discounts. `is_outlier` fires
+when the price field clearly isn't the sale price, when it's a keyboard-mash
+placeholder (`$1234` shows up ~46×), or when the discount is too deep to be real
+*and* nothing in the description (salvage, blown engine, …) explains it. Outliers
+stay in `valuation.csv` — the leave-one-out baseline already ignores them and the
+description scrape learns their tells — but are dropped from `deals.csv` and
+notifications.
+
+### Phase 2b: Description Signals
+
+The category feed only exposes title + price. `src/scraper/fetch_descriptions.py`
+visits each listing page (resumable, in batches — it's slow and bot-sensitive) to
+pull the **full seller description** plus the structured *About this vehicle*
+block (odometer, transmission, owners). `src/ml/sentiment.py` then runs a
+transparent lexicon + rule model over the description — **no API, no model
+download** — producing a `condition_score` (assurances like *no rust / new
+brakes / one owner* vs. red flags like *as-is / head gasket / needs work*), an
+`urgency_score`, and a `is_dealer_or_ad` flag. `valuation.py` folds these into a
+combined `deal_score` and drops dealer/ad posts from the deal list.
+
+Push notifications for high-`deal_score` listings are the remaining TODO.
 
 ## 🚀 Getting Started
 
@@ -78,10 +108,28 @@ description scrape first.
    Reads `listings_labeled.pkl` and writes:
 
    - `data/processed/valuation.csv` — every scored listing + entity median /
-     robust z-score / discount %
-   - `data/processed/deals.csv` — just the flagged underpriced listings, best first
+     mileage-adjusted price / robust z-score / discount % / `is_deal` /
+     `is_suspect` / `is_outlier`
+   - `data/processed/deals.csv` — the flagged underpriced listings (outliers and
+     suspects removed), best first
 
-   Thresholds live under `ml_pipeline.valuation` in `config.yaml`.
+   Thresholds live under `ml_pipeline.valuation` in `config.yaml`. Odometer comes
+   from Phase 2b, so run this again after scraping descriptions.
+
+7. **Scrape descriptions & score them** (Phase 2b, optional but recommended):
+
+   ```bash
+   poetry run python -m src.scraper.fetch_descriptions --deals            # candidates first
+   pwsh scripts/backfill_descriptions.ps1 -Since <YYYYMMDD> -RunSentiment  # backfill the rest
+   ```
+
+   `fetch_descriptions` is resumable — it appends to `data/raw/descriptions.csv`,
+   skips listings it already has, and fetches `--concurrency` pages at once
+   (default `scraping.concurrency_limit`; keep it 2–3, unauthenticated). `--since`
+   limits it to recent scrapes (older listings are mostly sold). The backfill
+   script loops it in spaced batches until the queue drains, then runs
+   `sentiment` (→ `data/processed/listing_signals.csv`) and re-runs `valuation`
+   to fold the signals into `deal_score`.
 
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
