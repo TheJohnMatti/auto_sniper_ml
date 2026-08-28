@@ -17,8 +17,9 @@ ml_pipeline:
   
   clustering:
     algorithm: "bisecting_kmeans"
-    # Starting guess for K, algorithm will optimize based on bisecting strategy
-    initial_k: 100 
+    # Upper bound on K; bisecting splits the highest-inertia cluster until reached.
+    # Treated as a ceiling and clamped down for small datasets (see cluster.choose_k).
+    initial_k: 250
     bisecting_strategy: "biggest_inertia"
     random_state: 42
 

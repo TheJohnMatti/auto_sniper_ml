@@ -43,3 +43,27 @@ Once listings are mapped to discrete entity IDs, the system applies statistical 
    ```bash
    poetry run python src/scraper/run.py
    ```
+
+   Writes one `data/raw/facebook_<city>_raw_<timestamp>.csv` per city. Columns:
+   `scraped_at, platform, location, raw_title, raw_price, raw_price_original,
+   raw_listing_location, raw_description, url`.
+
+4. **Run the Phase 1 ML Pipeline (entity resolution):**
+
+   ```bash
+   poetry run python -m src.ml.run_pipeline
+   ```
+
+   Consolidates every raw CSV, deduplicates by listing id, embeds titles,
+   bisecting-k-means clusters them, and labels each cluster (LLM if a key is set
+   in `.env`, otherwise a deterministic heuristic). Outputs:
+
+   - `data/processed/listings_labeled.{csv,pkl}` — one row per unique listing
+     with `cluster`, `canonical_label`, `entity_id`, `entity_label`
+   - `data/clusters/cluster_labels.csv` — one row per model cluster
+
+   Individual steps are runnable on their own for debugging, e.g.
+   `python -m src.ml.load_data` or `python -m src.ml.cluster`.
+
+> **Note:** if `poetry` is not on your PATH, call the project virtualenv's
+> interpreter directly (`poetry env info -p` prints its location).

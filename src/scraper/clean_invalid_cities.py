@@ -1,7 +1,7 @@
 import asyncio
 import os
 import glob
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright
 
 OUTPUT_DIR = "data/raw"
 
@@ -83,7 +83,7 @@ async def main():
                     except Exception as e:
                         print(f"    [!] Failed to delete {file_path}: {e}")
             else:
-                print(f"    [+] Route is valid.")
+                print("    [+] Route is valid.")
                 
             # Brief pause to respect rate limits
             await asyncio.sleep(1.5)
