@@ -6,9 +6,10 @@ The category feed only exposes title + price; the description lives on the
 individual listing page. Visiting ~2,400 pages is slow and raises bot-detection
 risk, so this runs in resumable batches:
 
-    python -m src.scraper.fetch_descriptions            # config batch size
-    python -m src.scraper.fetch_descriptions 40         # explicit batch size
-    python -m src.scraper.fetch_descriptions --deals    # deal/suspect candidates first
+    python -m src.scraper.fetch_descriptions                  # config batch size
+    python -m src.scraper.fetch_descriptions 40               # explicit batch size
+    python -m src.scraper.fetch_descriptions --deals          # deal/suspect candidates first
+    python -m src.scraper.fetch_descriptions --since=20260828 # only listings from recent scrapes
 
 State lives in data/raw/descriptions.csv (append-only). Each run skips item_ids
 already present and processes the next `description_batch_size` listings, newest
@@ -67,12 +68,17 @@ def _item_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _raw_files_newest_first() -> list[str]:
-    """Raw scrape CSVs sorted by the timestamp in their filename, newest first."""
-    def ts(path: str) -> str:
-        m = re.search(r"_(\d{8}_\d{6})\.csv$", path)
-        return m.group(1) if m else ""
-    return sorted(glob.glob(RAW_GLOB), key=ts, reverse=True)
+def _file_ts(path: str) -> str:
+    m = re.search(r"_(\d{8})_\d{6}\.csv$", path)
+    return m.group(1) if m else ""
+
+
+def _raw_files_newest_first(since: str | None = None) -> list[str]:
+    """Raw scrape CSVs sorted newest first; optionally only those on/after `since` (YYYYMMDD)."""
+    files = glob.glob(RAW_GLOB)
+    if since:
+        files = [f for f in files if _file_ts(f) >= since]
+    return sorted(files, key=_file_ts, reverse=True)
 
 
 def _priority_ids() -> list[str]:
@@ -92,15 +98,18 @@ def _priority_ids() -> list[str]:
     return ids
 
 
-def _pending(limit: int, deals_first: bool = False) -> tuple[list[tuple[str, str]], int, int]:
+def _pending(limit: int, deals_first: bool = False,
+             since: str | None = None) -> tuple[list[tuple[str, str]], int, int]:
     """(batch, total_pending, total_known) — unique listings not yet fetched.
 
     Newest scrape files are read first so fresh listings (more likely still live,
     and the ones we actually want to act on) are fetched before stale ones. With
     deals_first, listings the valuation step flagged are moved to the front.
+    `since` (YYYYMMDD) restricts to listings seen in scrapes on/after that date -
+    older listings are mostly sold and come back empty.
     """
     known: dict[str, str] = {}
-    for path in _raw_files_newest_first():
+    for path in _raw_files_newest_first(since):
         with open(path, "r", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
                 iid = _item_id(row.get("url", ""))
@@ -212,10 +221,11 @@ async def _fetch_one(ctx, iid: str, url: str) -> dict:
     return rec
 
 
-async def _run(limit: int, deals_first: bool = False) -> None:
+async def _run(limit: int, deals_first: bool = False, since: str | None = None) -> None:
     os.makedirs(RAW_DIR, exist_ok=True)
-    batch, pending, known = _pending(limit, deals_first=deals_first)
-    print(f"[*] {known} listings known, {pending} without a description; fetching {len(batch)} now.")
+    batch, pending, known = _pending(limit, deals_first=deals_first, since=since)
+    scope = f" (scrapes >= {since})" if since else ""
+    print(f"[*] {known} listings known{scope}, {pending} without a description; fetching {len(batch)} now.")
     if not batch:
         print("[+] Nothing to do.")
         return
@@ -240,8 +250,8 @@ async def _run(limit: int, deals_first: bool = False) -> None:
 
         await browser.close()
 
-    _, still_pending, _ = _pending(0)
-    print(f"[+] Done. {still_pending} listings still pending — re-run to continue.")
+    _, still_pending, _ = _pending(0, since=since)
+    print(f"[+] Done. {still_pending} listings still pending{scope} — re-run to continue.")
 
 
 def main() -> None:
@@ -249,13 +259,14 @@ def main() -> None:
 
     args = sys.argv[1:]
     deals_first = "--deals" in args
-    args = [a for a in args if a != "--deals"]
+    since = next((a.split("=", 1)[1] for a in args if a.startswith("--since=")), None)
+    args = [a for a in args if a != "--deals" and not a.startswith("--since=")]
 
     if args:
         limit = int(args[0])
     else:
         limit = int(load_config()["scraping"].get("description_batch_size", 150))
-    asyncio.run(_run(limit, deals_first=deals_first))
+    asyncio.run(_run(limit, deals_first=deals_first, since=since))
 
 
 if __name__ == "__main__":
