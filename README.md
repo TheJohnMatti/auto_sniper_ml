@@ -16,10 +16,16 @@ This project abandons the anti-pattern of passing raw, chaotic marketplace data 
 
 4. **Cluster Taxonomy (agent-in-the-loop):** The pipeline writes each cluster's centroid samples to `data/clusters/label_requests.json`. There is **no external LLM API** — the classification is a one-off curation pass done by the coding agent via the `label-clusters` skill, which writes canonical `Make Model` labels to `data/clusters/label_map.json`. Clusters left unlabeled fall back to a deterministic token-frequency heuristic. The pipeline then combines the model label with each listing's own parsed year into an `entity_label` / `entity_id` (e.g. `2014 Honda Civic`).
 
-### Phase 2: Valuation Regression (Supervised)
+### Phase 2: Valuation & Anomaly Detection
 
-*(In Development)*
-Once listings are mapped to discrete entity IDs, the system applies statistical pricing models (analyzing standard deviations, median historical prices, and mileage depreciation curves) to flag severely underpriced assets (Z-score anomaly detection) and fire push notifications.
+Once listings are mapped to entity IDs, `src/ml/valuation.py` builds a **robust
+price distribution per year+model entity** (median + MAD, not mean/std — market
+prices are heavy-tailed and full of scams/parts/typos). Each listing gets a
+leave-one-out robust z-score against its entity's other comps. Listings are
+flagged as **deals** when they clear the z-score, a minimum discount %, and are
+not so cheap they're almost certainly junk (**suspect**). Mileage-based
+depreciation and push notifications are still TODO — mileage needs the
+description scrape first.
 
 ## 🚀 Getting Started
 
@@ -62,6 +68,20 @@ Once listings are mapped to discrete entity IDs, the system applies statistical 
    skill. It reads `label_requests.json`, writes `data/clusters/label_map.json`,
    and you re-run step 4 to fold the curated labels in. Skip this and the
    pipeline still runs on heuristic labels.
+
+6. **Run Phase 2 valuation:**
+
+   ```bash
+   poetry run python -m src.ml.valuation
+   ```
+
+   Reads `listings_labeled.pkl` and writes:
+
+   - `data/processed/valuation.csv` — every scored listing + entity median /
+     robust z-score / discount %
+   - `data/processed/deals.csv` — just the flagged underpriced listings, best first
+
+   Thresholds live under `ml_pipeline.valuation` in `config.yaml`.
 
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
