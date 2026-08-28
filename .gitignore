@@ -16,6 +16,12 @@ data/clusters/
 *.parquet
 *.sqlite3
 
+# ...except the curated cluster labels (produced by the `label-clusters` skill,
+# expensive to regenerate, redone only when clustering changes materially).
+!data/clusters/
+data/clusters/*
+!data/clusters/label_map.json
+
 # Python Cache
 __pycache__/
 *.py[cod]

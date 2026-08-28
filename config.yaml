@@ -17,19 +17,22 @@ ml_pipeline:
   
   clustering:
     algorithm: "bisecting_kmeans"
-    # Starting guess for K, algorithm will optimize based on bisecting strategy
-    initial_k: 100 
+    # Upper bound on K; bisecting splits the highest-inertia cluster until reached.
+    # Treated as a ceiling and clamped down for small datasets (see cluster.choose_k).
+    initial_k: 250
     bisecting_strategy: "biggest_inertia"
     random_state: 42
 
-  llm_labeling:
-    provider: "openai" # or "gemini"
-    model: "gpt-4-turbo"
-    temperature: 0.1
-    samples_per_cluster: 5
-    prompt_template: >
-      You are an expert automotive taxonomist. 
-      Review the following {samples_per_cluster} messy marketplace listing titles. 
-      They all represent the exact same car model.
-      Return ONLY the canonical Year, Make, Model, and Trim (if applicable).
-      Example: "2015 Honda Civic LX"
+  labeling:
+    # No external API. run_pipeline writes centroid samples to
+    # data/clusters/label_requests.json; the `label-clusters` skill (invoked by
+    # the agent) turns them into data/clusters/label_map.json. Clusters without a
+    # curated label fall back to a deterministic token-frequency heuristic.
+    samples_per_cluster: 10
+
+  valuation:
+    # Phase 2: robust (median/MAD) z-score anomaly detection per year+model entity.
+    min_comps: 5           # entities with fewer comparable listings are not scored
+    z_threshold: -2.0      # robust z at or below this => flagged as a deal
+    min_discount_pct: 0.15 # ...and price must be at least this far below the median
+    suspect_ratio: 0.35    # price below suspect_ratio * median => likely junk, not a deal
