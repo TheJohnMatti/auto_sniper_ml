@@ -92,7 +92,9 @@ def _priority_ids() -> list[str]:
             continue
         with open(path, "r", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
-                if name == "valuation.csv" and row.get("is_suspect") not in ("True", "true", "1"):
+                if name == "valuation.csv" and not any(
+                    row.get(col) in ("True", "true", "1") for col in ("is_suspect", "is_outlier")
+                ):
                     continue
                 iid = _item_id(row.get("url", ""))
                 if iid:

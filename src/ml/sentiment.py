@@ -62,6 +62,15 @@ DEALER_OR_AD = {
     "dealer_boilerplate": r"\badministration fee\b|\badmin fee\b|\bplus (?:hst|tax|taxes)\b|\bdoc fee\b|\bfinancing available\b|\bwholesale direct\b|\bcall today\b|\bapply (?:online|now)\b|\bo\.?a\.?c\.?\b",
 }
 
+# The number in the price field is NOT the sale price - it's a finance payment, a
+# lease buy-in, or a rental deposit. These listings are "too cheap" as a data
+# artefact, not a deal, so valuation drops them at inference time.
+PRICE_NOT_SALE = {
+    "finance_payment": r"\bbi[\s-]?weekly\b|\bweekly payment\b|\b(?:payment|pymt)s?\s+(?:of|from|as low as|starting)\b|\bpayments? as low as\b|\bas low as \$?\d+\s*(?:\+ ?tax|bi|/|per|a )|\$\d+\s*(?:\+ ?tax\s*)?(?:bi[\s-]?weekly|/ ?(?:mo|month)|per month|a month|monthly)\b|\b0\$? ?down\b|\b\$0 down\b",
+    "lease_takeover": r"\blease (?:transfer|takeover|take[\s-]?over|assumption|buyout)\b|\btake over (?:the |my |this )?lease\b|\bassume (?:the |my )?lease\b|\bmonths? (?:remaining|left) on (?:the |my )?lease\b|\blease [a-z ]{0,12}remaining\b",
+    "rental_deposit": r"\bfor rent\b|\bcar rental\b|\brental car\b|\brent[\s-]?to[\s-]?own\b|\bweekly rate\b|\bdaily rate\b|\bdeposit required\b|\brent it\b",
+}
+
 _CONTACT_ONLY = re.compile(r"^[\s\d.,+()-]*(?:call|text|phone|for more info(?:rmation)?|contact)?[\s\d.,+()x-]*$", re.I)
 
 
@@ -89,6 +98,7 @@ def score_descriptions(df: pd.DataFrame) -> pd.DataFrame:
         n_pos, pos = _count_hits(text, POSITIVES)
         n_urg, urg = _count_hits(text, URGENCY)
         n_ad, ad = _count_hits(text, DEALER_OR_AD)
+        n_notsale, notsale = _count_hits(text, PRICE_NOT_SALE)
 
         # "no rust" / "no accidents" trip both lexicons - the assurance wins.
         for assurance, flag in (("no_rust", "rust"), ("no_accidents", "accident_damage")):
@@ -114,6 +124,8 @@ def score_descriptions(df: pd.DataFrame) -> pd.DataFrame:
             "positives": ";".join(pos),
             "urgency_cues": ";".join(urg),
             "is_dealer_or_ad": is_ad,
+            "price_not_sale_price": bool(n_notsale),
+            "price_not_sale_cues": ";".join(notsale),
             "odometer_km": r.odometer_km,
             "transmission": r.transmission,
             "listed_age": r.listed_age,
@@ -135,6 +147,7 @@ def main() -> None:
     scored = signals[signals["has_description"]]
     print(f"[+] Scored {len(scored)} descriptions -> {SIGNALS_PATH}")
     print(f"    dealer/ad or junk : {int(signals['is_dealer_or_ad'].sum())}")
+    print(f"    price != sale price: {int(signals['price_not_sale_price'].sum())} (finance/lease/rental)")
     print(f"    >=1 red flag      : {int((scored['red_flag_count'] >= 1).sum())}")
     print(f"    positive condition : {int((scored['condition_score'] > 0.2).sum())}")
     print(f"    negative condition : {int((scored['condition_score'] < -0.2).sum())}")

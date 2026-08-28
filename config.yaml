@@ -35,7 +35,13 @@ ml_pipeline:
 
   valuation:
     # Phase 2: robust (median/MAD) z-score anomaly detection per year+model entity.
+    # Prices are mileage-adjusted (src/ml/mileage.py) before scoring.
     min_comps: 5           # entities with fewer comparable listings are not scored
     z_threshold: -2.0      # robust z at or below this => flagged as a deal
     min_discount_pct: 0.15 # ...and price must be at least this far below the median
     suspect_ratio: 0.35    # price below suspect_ratio * median => likely junk, not a deal
+    # "Too good to be true" outlier filter (kept in valuation.csv, dropped from
+    # deals.csv + notifications at inference; still trained on).
+    outlier_ratio: 0.25       # price below this * raw median => implausible discount
+    outlier_z: -4.0           # ...or robust z at/below this
+    project_car_floor: 400    # a severe-flag car (salvage/blown engine) this cheap is a real listing, not an outlier

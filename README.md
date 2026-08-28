@@ -25,6 +25,24 @@ leave-one-out robust z-score against its entity's other comps. Listings are
 flagged as **deals** when they clear the z-score, a minimum discount %, and are
 not so cheap they're almost certainly junk (**suspect**).
 
+**Mileage adjustment (`src/ml/mileage.py`):** a 300 000 km car and a 90 000 km
+car of the same year+model aren't comparable, so the high-km one looks like a
+steal. The module fits one pooled, robust (median-of-pairwise-slopes)
+depreciation curve — `log(price) ≈ entity_effect + β·km`, currently ≈ **−3×10⁻⁶
+log$/km (~27 % per 100 000 km)** — and restates every price to a 120 000 km
+reference before scoring. Cars with no / implausible odometer are held at their
+entity's median odometer (i.e. barely moved).
+
+**Outlier filter ("too good to be true"):** free/$1 BMWs whose description is
+really "make me an offer", finance-payment ads (`$281 bi-weekly`), lease
+buy-ins and rental deposits all read as enormous discounts. `is_outlier` fires
+when the price field clearly isn't the sale price, when it's a keyboard-mash
+placeholder (`$1234` shows up ~46×), or when the discount is too deep to be real
+*and* nothing in the description (salvage, blown engine, …) explains it. Outliers
+stay in `valuation.csv` — the leave-one-out baseline already ignores them and the
+description scrape learns their tells — but are dropped from `deals.csv` and
+notifications.
+
 ### Phase 2b: Description Signals
 
 The category feed only exposes title + price. `src/scraper/fetch_descriptions.py`
@@ -37,8 +55,7 @@ brakes / one owner* vs. red flags like *as-is / head gasket / needs work*), an
 `urgency_score`, and a `is_dealer_or_ad` flag. `valuation.py` folds these into a
 combined `deal_score` and drops dealer/ad posts from the deal list.
 
-Mileage-adjusted valuation (using the scraped odometer) and push notifications
-are the remaining TODO.
+Push notifications for high-`deal_score` listings are the remaining TODO.
 
 ## 🚀 Getting Started
 
@@ -91,10 +108,13 @@ are the remaining TODO.
    Reads `listings_labeled.pkl` and writes:
 
    - `data/processed/valuation.csv` — every scored listing + entity median /
-     robust z-score / discount %
-   - `data/processed/deals.csv` — just the flagged underpriced listings, best first
+     mileage-adjusted price / robust z-score / discount % / `is_deal` /
+     `is_suspect` / `is_outlier`
+   - `data/processed/deals.csv` — the flagged underpriced listings (outliers and
+     suspects removed), best first
 
-   Thresholds live under `ml_pipeline.valuation` in `config.yaml`.
+   Thresholds live under `ml_pipeline.valuation` in `config.yaml`. Odometer comes
+   from Phase 2b, so run this again after scraping descriptions.
 
 7. **Scrape descriptions & score them** (Phase 2b, optional but recommended):
 
