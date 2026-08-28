@@ -21,6 +21,7 @@
 param(
     [int]    $BatchSize   = 150,
     [string] $Since       = "",          # YYYYMMDD; "" = all listings
+    [int]    $Concurrency = 3,            # pages in flight per batch; keep low (2-3)
     [int]    $MaxRuns     = 30,
     [int]    $MinSleepMin = 12,
     [int]    $MaxSleepMin = 22,
@@ -51,7 +52,7 @@ $log = Join-Path $logDir ("backfill_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmm
 Write-Host "[backfill] python : $py"
 Write-Host "[backfill] log    : $log"
 
-$moduleArgs = @("-u", "-m", "src.scraper.fetch_descriptions", "$BatchSize")
+$moduleArgs = @("-u", "-m", "src.scraper.fetch_descriptions", "$BatchSize", "--concurrency=$Concurrency")
 if ($Since) { $moduleArgs += "--since=$Since" }
 
 $lastPending = [int]::MaxValue

@@ -6,15 +6,17 @@ The category feed only exposes title + price; the description lives on the
 individual listing page. Visiting ~2,400 pages is slow and raises bot-detection
 risk, so this runs in resumable batches:
 
-    python -m src.scraper.fetch_descriptions                  # config batch size
-    python -m src.scraper.fetch_descriptions 40               # explicit batch size
-    python -m src.scraper.fetch_descriptions --deals          # deal/suspect candidates first
-    python -m src.scraper.fetch_descriptions --since=20260828 # only listings from recent scrapes
+    python -m src.scraper.fetch_descriptions                   # config batch size + concurrency
+    python -m src.scraper.fetch_descriptions 40                # explicit batch size
+    python -m src.scraper.fetch_descriptions --deals           # deal/suspect candidates first
+    python -m src.scraper.fetch_descriptions --since=20260828  # only listings from recent scrapes
+    python -m src.scraper.fetch_descriptions --concurrency=3   # N pages in flight at once
 
 State lives in data/raw/descriptions.csv (append-only). Each run skips item_ids
 already present and processes the next `description_batch_size` listings, newest
-scrape first. Downstream: src/ml/sentiment.py turns raw_description into
-condition/urgency signals.
+scrape first. Concurrency defaults to `scraping.concurrency_limit` in config;
+keep it low (2-3) - these are unauthenticated requests from one IP. Downstream:
+src/ml/sentiment.py turns raw_description into condition/urgency signals.
 """
 import asyncio
 import csv
@@ -221,16 +223,22 @@ async def _fetch_one(ctx, iid: str, url: str) -> dict:
     return rec
 
 
-async def _run(limit: int, deals_first: bool = False, since: str | None = None) -> None:
+async def _run(limit: int, deals_first: bool = False, since: str | None = None,
+               concurrency: int = 1) -> None:
     os.makedirs(RAW_DIR, exist_ok=True)
     batch, pending, known = _pending(limit, deals_first=deals_first, since=since)
     scope = f" (scrapes >= {since})" if since else ""
-    print(f"[*] {known} listings known{scope}, {pending} without a description; fetching {len(batch)} now.")
+    print(f"[*] {known} listings known{scope}, {pending} without a description; "
+          f"fetching {len(batch)} now (concurrency={concurrency}).")
     if not batch:
         print("[+] Nothing to do.")
         return
 
     new_file = not os.path.exists(OUT_PATH)
+    done = 0
+    sem = asyncio.Semaphore(max(1, concurrency))
+    write_lock = asyncio.Lock()
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         ctx = await browser.new_context(user_agent=_UA, viewport={"width": 1400, "height": 900})
@@ -239,14 +247,22 @@ async def _run(limit: int, deals_first: bool = False, since: str | None = None) 
             writer = csv.DictWriter(fh, fieldnames=FIELDS)
             if new_file:
                 writer.writeheader()
-
-            for i, (iid, url) in enumerate(batch, 1):
-                rec = await _fetch_one(ctx, iid, url)
-                writer.writerow(rec)
                 fh.flush()
-                print(f"  [{i}/{len(batch)}] {iid}  {rec['status']}  "
-                      f"desc={len(rec['raw_description'])}c  km={rec['odometer_km'] or '-'}")
-                await asyncio.sleep(2.0 + random.random() * 1.5)
+
+            async def worker(iid: str, url: str) -> None:
+                nonlocal done
+                async with sem:
+                    rec = await _fetch_one(ctx, iid, url)
+                    # jitter stays *inside* the semaphore so it also paces throughput
+                    await asyncio.sleep(2.0 + random.random() * 1.5)
+                async with write_lock:
+                    writer.writerow(rec)
+                    fh.flush()
+                    done += 1
+                    print(f"  [{done}/{len(batch)}] {iid}  {rec['status']}  "
+                          f"desc={len(rec['raw_description'])}c  km={rec['odometer_km'] or '-'}")
+
+            await asyncio.gather(*(worker(iid, url) for iid, url in batch))
 
         await browser.close()
 
@@ -260,13 +276,13 @@ def main() -> None:
     args = sys.argv[1:]
     deals_first = "--deals" in args
     since = next((a.split("=", 1)[1] for a in args if a.startswith("--since=")), None)
-    args = [a for a in args if a != "--deals" and not a.startswith("--since=")]
+    conc = next((int(a.split("=", 1)[1]) for a in args if a.startswith("--concurrency=")), None)
+    args = [a for a in args if a != "--deals" and not a.startswith(("--since=", "--concurrency="))]
 
-    if args:
-        limit = int(args[0])
-    else:
-        limit = int(load_config()["scraping"].get("description_batch_size", 150))
-    asyncio.run(_run(limit, deals_first=deals_first, since=since))
+    cfg = load_config()["scraping"]
+    limit = int(args[0]) if args else int(cfg.get("description_batch_size", 150))
+    concurrency = conc if conc is not None else int(cfg.get("concurrency_limit", 1))
+    asyncio.run(_run(limit, deals_first=deals_first, since=since, concurrency=concurrency))
 
 
 if __name__ == "__main__":
