@@ -12,6 +12,10 @@ leave-one-out so it never inflates its own baseline.
 
     python -m src.ml.valuation
 
+If `data/processed/listing_signals.csv` exists (from src.ml.sentiment), the
+description-derived condition / urgency / dealer-ad signals are folded into a
+combined `deal_score` and the deal list is ranked and filtered by it.
+
 Outputs:
     data/processed/valuation.csv   every scored listing + entity stats + robust_z
     data/processed/deals.csv       just the flagged underpriced listings, best first
@@ -24,6 +28,7 @@ import pandas as pd
 from src.ml.config import ml_config
 
 LABELED_PATH = "data/processed/listings_labeled.pkl"
+SIGNALS_PATH = "data/processed/listing_signals.csv"
 PROCESSED_DIR = "data/processed"
 
 _MAD_TO_SIGMA = 1.4826  # makes MAD a consistent estimator of sigma for normal data
@@ -87,29 +92,70 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     return scored.sort_values("robust_z")
 
 
+_SIGNAL_COLS = [
+    "has_description", "condition_score", "urgency_score", "red_flag_count",
+    "red_flags", "is_dealer_or_ad", "odometer_km",
+]
+
+
+def attach_signals(scored: pd.DataFrame, path: str = SIGNALS_PATH) -> pd.DataFrame:
+    """Left-join description signals and compute a combined deal_score."""
+    if os.path.exists(path):
+        sig = pd.read_csv(path, dtype={"item_id": str})
+        keep = ["item_id"] + [c for c in _SIGNAL_COLS if c in sig.columns]
+        scored = scored.merge(sig[keep], on="item_id", how="left")
+
+    for col, default in (("has_description", False), ("is_dealer_or_ad", False),
+                         ("condition_score", 0.0), ("urgency_score", 0.0),
+                         ("red_flag_count", 0), ("red_flags", "")):
+        if col not in scored.columns:
+            scored[col] = default
+        scored[col] = scored[col].fillna(default)
+
+    # how far below market, capped so a 3-comp blowup doesn't dominate
+    underpricing = (scored["discount_pct"] / 0.5).clip(0.0, 1.0)
+    scored["deal_score"] = (
+        underpricing
+        + 0.30 * scored["condition_score"]
+        + 0.10 * scored["urgency_score"]
+        - 0.15 * scored["red_flag_count"].clip(upper=4)
+        - 0.50 * scored["is_dealer_or_ad"].astype(float)
+    ).round(3)
+
+    # a dealer ad / "we buy cars" post is never a deal, however cheap it looks
+    scored.loc[scored["is_dealer_or_ad"], "is_deal"] = False
+    return scored
+
+
 def main() -> None:
     if not os.path.exists(LABELED_PATH):
         raise FileNotFoundError(f"{LABELED_PATH} not found. Run `python -m src.ml.run_pipeline` first.")
 
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     df = pd.read_pickle(LABELED_PATH)
-    scored = score_listings(df)
+    scored = attach_signals(score_listings(df))
 
     cols = [
         "entity_label", "price", "entity_median", "discount_pct", "robust_z",
-        "entity_comps", "is_deal", "is_suspect", "seller_marked_down",
-        "raw_price_original", "location", "raw_listing_location", "url",
+        "entity_comps", "deal_score", "is_deal", "is_suspect", "seller_marked_down",
+        "has_description", "condition_score", "urgency_score", "red_flags",
+        "is_dealer_or_ad", "odometer_km", "raw_price_original", "location",
+        "raw_listing_location", "url",
     ]
+    cols = [c for c in cols if c in scored.columns]
     valuation_path = os.path.join(PROCESSED_DIR, "valuation.csv")
     deals_path = os.path.join(PROCESSED_DIR, "deals.csv")
-    scored[cols].to_csv(valuation_path, index=False)
+    scored[cols].sort_values("deal_score", ascending=False).to_csv(valuation_path, index=False)
 
-    deals = scored[scored["is_deal"]].copy()
+    deals = scored[scored["is_deal"]].sort_values("deal_score", ascending=False).copy()
     deals[cols].to_csv(deals_path, index=False)
 
     n_scored = int((scored["entity_comps"] >= ml_config()["valuation"]["min_comps"]).sum())
+    n_desc = int(scored["has_description"].sum())
     print(f"[+] Scored {n_scored} listings across "
           f"{scored.loc[scored['entity_comps'] >= 5, 'entity_id'].nunique()} entities with enough comps")
+    print(f"[+] {n_desc} listings have a scraped description; "
+          f"{int(scored['is_dealer_or_ad'].sum())} flagged dealer/ad")
     print(f"[+] {len(deals)} deals, {int(scored['is_suspect'].sum())} suspect (likely junk/scam)")
     print(f"[+] Wrote {valuation_path} and {deals_path}")
 
@@ -118,11 +164,11 @@ def main() -> None:
             price=lambda d: d["price"].map("${:,.0f}".format),
             median=lambda d: d["entity_median"].map("${:,.0f}".format),
             off=lambda d: (d["discount_pct"] * 100).map("{:.0f}%".format),
-            z=lambda d: d["robust_z"].map("{:.2f}".format),
+            cond=lambda d: d["condition_score"].map("{:+.2f}".format),
         )
-        print("\nTop deals:")
-        print(show[["entity_label", "price", "median", "off", "z", "entity_comps",
-                    "seller_marked_down", "location"]].to_string(index=False))
+        print("\nTop deals (by deal_score):")
+        print(show[["entity_label", "price", "median", "off", "deal_score", "cond",
+                    "red_flags", "entity_comps", "location"]].to_string(index=False))
 
 
 if __name__ == "__main__":

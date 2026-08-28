@@ -3,6 +3,9 @@ scraping:
   headless: true
   concurrency_limit: 3
   timeout_ms: 30000
+  # Per-run cap for the incremental detail-page description scrape
+  # (src/scraper/fetch_descriptions.py). Resumes where it left off each run.
+  description_batch_size: 150
   targets:
     - platform: "facebook_marketplace"
       base_url: "https://www.facebook.com/marketplace/toronto/cars/"
