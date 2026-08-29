@@ -177,3 +177,43 @@ released for retry). Point `$NOTIFY_DB` at a mounted volume in a container.
 
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
+
+## ☁️ Deployment (scheduled GitHub Action)
+
+`.github/workflows/pipeline.yml` runs the whole chain
+(`scripts/run_once.sh`: scrape → entity resolution → descriptions → sentiment →
+valuation → notify) every 6 hours on a GitHub-hosted runner. The repo is public
+so Actions minutes are free.
+
+**Why not Vercel / a serverless cron:** the pipeline needs `torch` +
+`sentence-transformers` (~1 GB, over Vercel's 250 MB function limit), a real
+Chromium for Playwright, and a persistent disk for the notify state DB — none of
+which serverless provides. A GitHub Action gets a full VM and is itself a cron.
+
+**Setup:**
+
+1. Add the ntfy topic as a repo secret (never commit it — public repo):
+   ```bash
+   gh secret set NTFY_TOPIC        # paste your long random topic
+   gh secret set NTFY_TOKEN        # optional: only for protected / self-hosted
+   ```
+2. Enable Actions for the repo. The schedule starts on its own; use
+   **Run workflow** (`workflow_dispatch`) for a manual run — it has
+   `skip_scrape` / `skip_descriptions` toggles.
+
+**State between runs** lives in the `pipeline-data-*` Actions cache (`data/` —
+raw scrapes, `descriptions.csv`, the embedding cache, and `notified.sqlite3`).
+The cron never idles long enough for the 7-day cache eviction to bite; if it
+does, the next run rebuilds from scratch and may re-notify current deals once.
+`deals.csv` / `valuation.csv` are also uploaded as a run artifact (14 days).
+
+**Caveats:**
+
+- **Facebook may block the runner's datacenter IP** for unauthenticated
+  Marketplace requests. If scrapes come back empty, run the scraper from a
+  residential IP (locally or a small VPS) and let the Action do everything after
+  `--skip-scrape`, or add a proxy.
+- **Label drift:** clustering is re-run each time, so as the listing population
+  churns, cluster ids shift and the curated `data/clusters/label_map.json`
+  gradually stops matching (clusters fall back to the heuristic label). Re-run
+  the `label-clusters` skill and commit a fresh `label_map.json` every few weeks.
