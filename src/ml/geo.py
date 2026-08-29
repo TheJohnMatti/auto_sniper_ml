@@ -89,6 +89,18 @@ _TOWN_COORDS: dict[str, tuple[float, float]] = {
 _UK_HINT = re.compile(r"\b(uk|united kingdom|england|gb)\b", re.I)
 _LOC_RE = re.compile(r"^\s*(.*?)\s*,\s*[A-Za-z]{2,3}\.?\s*$")
 
+# Facebook often shows the *township* (Middlesex Centre, Zorra, Thames Centre...)
+# rather than the nearest town. These are all the rural municipalities of the
+# counties that ring London - the commutershed - so any hit is in-region.
+_SWON_COUNTY_MARKERS = (
+    "middlesex", "elgin", "oxford", "perth", "huron", "lambton",
+    "zorra", "caradoc", "dorchester", "tavistock", "blandford", "blenheim",
+    "nissouri", "ekfrid", "mosa", "metcalfe", "biddulph", "mcgillivray",
+    "usborne", "hibbert", "downie", "blanshard", "fullarton", "ellice",
+    "mornington", "wilmot", "thames centre", "malahide", "bayham", "southwold",
+    "aylmer", "strathroy", "adelaide", "lucan biddulph",
+)
+
 
 def _norm_town(text: str) -> str | None:
     """'St. Thomas, ON' -> 'st thomas'. Returns None if it isn't a Town, PROV line."""
@@ -134,9 +146,10 @@ def in_region(location: str, center: tuple[float, float] | None = None,
     if town is None:
         return False
     coord = _TOWN_COORDS.get(town) or _TOWN_COORDS.get(town.replace("-", " "))
-    if coord is None:
-        return False
-    return haversine_km(coord, center) <= radius_km
+    if coord is not None:
+        return haversine_km(coord, center) <= radius_km
+    # unknown place name - accept it only if it names a ring county / township
+    return any(marker in town for marker in _SWON_COUNTY_MARKERS)
 
 
 if __name__ == "__main__":

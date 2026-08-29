@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   retrain:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.PIPELINE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +56,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt \
             --extra-index-url https://download.pytorch.org/whl/cpu
-          python -m playwright install --with-deps chromium
+          python -m playwright install chromium
 
       - name: Full retrain (scrape + observe + re-cluster + valuation + notify)
         env:

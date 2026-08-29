@@ -19,11 +19,27 @@ set -euo pipefail
 PY="${PYTHON:-python}"
 cd "$(dirname "$0")/.."
 
+# Single-flight: a scheduled 5-10 min interval can outpace a slow description
+# scrape, so never let two runs overlap (they share the cache + state DBs).
+LOCK="${TMPDIR:-/tmp}/auto_sniper_run_once.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "[i] another run_once.sh is already running ($LOCK) - exiting"
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
 log() { printf '\n=== %s ===\n' "$1"; }
 
 if [ "${SKIP_SCRAPE:-0}" != "1" ]; then
   log "scrape"
   "$PY" -m src.scraper.run || echo "[!] scrape failed - continuing on cached data"
+fi
+
+if ! ls data/raw/facebook_*_raw_*.csv >/dev/null 2>&1; then
+  echo "[!] no scraped data in data/raw/ - nothing to process."
+  echo "    Facebook serves a login wall to datacenter IPs; the scrape must run"
+  echo "    from a residential IP (your machine / a self-hosted runner). See README."
+  exit 1
 fi
 
 log "observation log"

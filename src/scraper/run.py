@@ -118,21 +118,42 @@ class MarketplaceScraper:
             await asyncio.sleep(3.0)
             print(f"[*] Scroll {i + 1}/{scrolls} done.")
 
+    # Ordered by robustness: the item-link selector survives FB's class churn far
+    # better than the internal data-virtualized attribute.
+    _CARD_SELECTORS = (
+        "a[href*='/marketplace/item/']",
+        "[data-virtualized='false']",
+    )
+
     async def _extract_listings(self, page: Page):
-        """
-        Extracts data using the platform-specific selectors passed during initialization.
-        """
+        """Pull listing cards from the rendered feed, trying each known selector."""
         print(f"[*] Extracting {self.platform_name} data from DOM...")
 
-        LISTING_CARD_SELECTOR = self.selectors["card"]
+        selectors = [self.selectors["card"], *self._CARD_SELECTORS]
+        cards = []
+        for sel in selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=5000)
+                cards = await page.locator(sel).all()
+                if cards:
+                    print(f"[*] Matched {len(cards)} cards with {sel!r}")
+                    break
+            except Exception:
+                continue
 
-        # We use a try/except here so if the page isn't fully loaded, it doesn't crash the whole run
-        try:
-            # Wait a moment for the cards to render
-            await page.wait_for_selector(LISTING_CARD_SELECTOR, timeout=5000)
-            cards = await page.locator(LISTING_CARD_SELECTOR).all()
-        except Exception as e:
-            print(f"[!] Could not find any listings with selector '{LISTING_CARD_SELECTOR}': {e}")
+        if not cards:
+            # Almost always a login wall served to a datacenter IP. Dump what we
+            # got so it can be inspected from the run artifacts.
+            print("[!] No listing cards found - dumping page for inspection "
+                  "(login wall / bot gate / selector rot?).")
+            try:
+                dump = os.path.join(OUTPUT_DIR, f"_debug_{self.location}.html")
+                with open(dump, "w", encoding="utf-8") as fh:
+                    fh.write(await page.content())
+                await page.screenshot(path=dump.replace(".html", ".png"), full_page=False)
+                print(f"[!] Wrote {dump} (+ .png)")
+            except Exception as e:
+                print(f"[!] dump failed: {e}")
             return
 
         for card in cards:
@@ -144,10 +165,13 @@ class MarketplaceScraper:
                 if parsed is None:
                     continue
 
-                # Extract href from the first nested <a> tag
-                url_locator = card.locator("a").first
-                url_suffix = await url_locator.get_attribute("href") if await url_locator.count() > 0 else ""
-                url_suffix = url_suffix or ""
+                # The card may itself be the <a href="/marketplace/item/..."> or
+                # contain one.
+                url_suffix = await card.get_attribute("href") or ""
+                if "/marketplace/item/" not in url_suffix:
+                    link = card.locator("a[href*='/marketplace/item/'], a").first
+                    if await link.count() > 0:
+                        url_suffix = await link.get_attribute("href") or ""
 
                 # Construct full URL if needed (some sites use relative paths)
                 full_url = (

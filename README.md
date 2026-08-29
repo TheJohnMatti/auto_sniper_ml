@@ -178,18 +178,42 @@ released for retry). Point `$NOTIFY_DB` at a mounted volume in a container.
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
 
-## ☁️ Deployment (scheduled GitHub Actions)
+## ☁️ Deployment
+
+The scrape **must originate from a residential IP.** Facebook serves an
+unauthenticated login wall to datacenter IPs — verified: GitHub-hosted runners
+get zero listing cards, a residential connection gets the full feed. So the
+pipeline runs on your machine (or any residential-IP host / self-hosted runner),
+not a GitHub-hosted runner.
+
+### Fastest path — a launchd job on your Mac
+
+```bash
+bash scripts/local-cron.sh install 600     # run every 10 min; `uninstall` / `status` too
+tail -f logs/pipeline.log
+```
+
+Needs the `.venv` (see Getting Started) and `NTFY_TOPIC` in `.env`. `run_once.sh`
+single-flights itself, so a slow description scrape won't cause overlapping runs.
+
+### The workflows (`.github/workflows/`)
 
 Two workflows, one shared `concurrency` group so they never run at once:
 
 | Workflow | Cadence | What it does |
 |---|---|---|
-| `pipeline.yml` | **hourly** | scrape (SW Ontario) → observation log → **incremental** entity resolution (assign to frozen clusters, no re-cluster) → descriptions → sentiment → valuation → notify |
-| `retrain.yml` | **weekly** (Mon 08:00 UTC) | same chain but `FULL_RETRAIN=1` — re-clusters the entity model over the **whole accumulated corpus**, refreshes the model snapshot the hourly job assigns against, and reports which clusters need labeling |
+| `pipeline.yml` | hourly | scrape (SW Ontario) → observation log → **incremental** entity resolution (assign to frozen clusters, no re-cluster) → descriptions → sentiment → valuation → notify |
+| `retrain.yml` | weekly (Mon 08:00 UTC) | same chain but `FULL_RETRAIN=1` — re-clusters over the **whole accumulated corpus**, refreshes the model snapshot the hourly job assigns against, reports which clusters need labeling |
 
 Both call `scripts/run_once.sh`. The split keeps entity definitions — and so
 "what counts as a deal" — stable between weekly rebuilds, and makes cluster
 labeling a weekly checkpoint instead of an hourly ask.
+
+`runs-on` is `${{ vars.PIPELINE_RUNNER || 'ubuntu-latest' }}` — register a
+**self-hosted runner** on a residential connection and set the repo variable
+`PIPELINE_RUNNER` to its label, and the workflows scrape from home. On the
+default GitHub runner everything past the (empty) scrape still runs, so it's a
+usable dry-run / retrain-labeling path but sends no new deals.
 
 **Continuous training.** `src/ml/observe.py` writes an append-only
 `observations.sqlite3` every run: one row per (listing, sighting), plus a
@@ -199,53 +223,43 @@ sold-vs-not label — the substrate for a learned deal classifier that the weekl
 retrain will train once there's enough history (not built yet; the z-score +
 lexicon rules are the current scorer and become its features).
 
-**Why not Vercel / a serverless cron:** the pipeline needs `torch` +
-`sentence-transformers` (~1 GB, over Vercel's 250 MB function limit), a real
-Chromium for Playwright, and a persistent disk for the state DBs — none of which
-serverless provides. A GitHub Action gets a full VM and is itself a cron.
+**Continuous training.** `src/ml/observe.py` writes an append-only
+`observations.sqlite3` every run: one row per (listing, sighting), plus a
+`listing_history` table with first/last-seen, the price path, and a `gone_at`
+(sold / delisted / aged out). Weeks of this give price-trajectory features and a
+sold-vs-not label — the substrate for a learned deal classifier the weekly
+retrain will train once there's enough history (not built yet; the z-score +
+lexicon rules are the current scorer and become its features).
 
-**Cadence caveat:** GitHub's scheduler is best-effort (a `* * * *` job often
-fires 5–15 min late, and can be skipped under load). For true ~5-minute *sniper*
-latency, run a lightweight torch-free scanner (feed scrape → match against the
-frozen model → notify) as an always-on loop on a small always-free VM (Oracle
-Cloud / Fly.io) and keep these Actions as the rebuild + fallback. Not built yet.
+**Why not Vercel / serverless:** needs `torch` + `sentence-transformers` (~1 GB,
+over Vercel's 250 MB limit), a real Chromium, a persistent disk for the state
+DBs — and a non-datacenter IP for the scrape. None of that is serverless.
 
 **Secrets** are GitHub Actions repo secrets (encrypted, never in code / logs /
-PRs). `NTFY_TOPIC` is already set; add `NTFY_TOKEN` too if you move to a
-protected or self-hosted ntfy topic:
+PRs) — `NTFY_TOPIC` is set. Local runs read the gitignored `.env` instead. For a
+self-hosted runner, `gh secret set NTFY_TOPIC` still applies; `NTFY_TOKEN` is
+optional (protected / self-hosted ntfy).
 
-```bash
-gh secret set NTFY_TOPIC        # your long random topic (also in local .env)
-gh secret set NTFY_TOKEN        # optional
-```
-
-Then enable Actions for the repo. The schedules start on their own; use **Run
-workflow** (`workflow_dispatch`) for a manual run — `pipeline` has `skip_scrape`
-/ `skip_descriptions` toggles.
-
-**State between runs** lives in the `pipeline-data-*` Actions cache (`data/` —
-raw scrapes, `descriptions.csv`, embedding cache, `observations.sqlite3`, the
-frozen model snapshot, `notified.sqlite3`). Hourly runs mean the 7-day cache
-eviction never bites; if it does, the next run rebuilds from scratch and may
-re-notify current deals once. `deals.csv` / `valuation.csv` upload as run
-artifacts.
+**State between runs** on a self-hosted runner is just the working tree; on a
+GitHub runner it's the `pipeline-data-*` Actions cache (`data/` — raw scrapes,
+`descriptions.csv`, embedding cache, `observations.sqlite3`, the frozen model
+snapshot, `notified.sqlite3`). Locally via `local-cron.sh` it's `data/` on disk.
 
 **Caveats:**
 
 - **Region gate:** production only surfaces deals whose town is within
-  `ml_pipeline.inference.region.radius_km` of London, ON (`src/ml/geo.py`).
-  Comps/baselines still use everything scraped. Widen `radius_km` (or the scrape
-  radius) to include Windsor-Essex.
-- **Facebook may block the runner's datacenter IP** for unauthenticated
-  Marketplace requests. If scrapes come back empty, run the scraper from a
-  residential IP (locally or a small VPS) and let the Action do everything with
-  `skip_scrape`, or add a proxy.
-- **Coordinate scrape is unverified against live Facebook** from this
-  environment: `/marketplace/category/vehicles?latitude=…&longitude=…&radius=…`
-  is confirmed to resolve to "London, Ontario", but the card selector
-  (`[data-virtualized='false']`) and scroll behaviour on that route need a real
-  smoke-test run. `_extract_listings` fails soft (logs, returns nothing) if the
-  selector has rotted.
+  `ml_pipeline.inference.region.radius_km` of London, ON (`src/ml/geo.py`),
+  with a county/township-name fallback for the rural municipalities FB often
+  shows. Comps/baselines still use everything scraped. Widen `radius_km` (or the
+  scrape radius) to include Windsor-Essex / Norfolk / Brant.
+- **Scrape verified** from a residential IP (~74 SW-Ontario listings/pass,
+  newest-first, `[data-virtualized='false']` and `a[href*='/marketplace/item/']`
+  both match). `_extract_listings` fails soft — dumps the page to
+  `data/raw/_debug_*.html` + `.png` — if it gets a login wall (datacenter IP) or
+  the selectors rot.
+- **~90-listing wall:** unauthenticated FB cuts the feed at ~100, so each pass
+  sees only the newest ~74. Fine for a sniper (newest is what matters); a
+  shorter poll interval covers more ground.
 - **Label upkeep:** the weekly `retrain` re-clusters and writes a fresh
   `label_requests.json`; new clusters fall back to the heuristic label until you
   run the `label-clusters` skill and commit an updated `label_map.json`. The
