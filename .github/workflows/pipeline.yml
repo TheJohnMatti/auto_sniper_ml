@@ -1,9 +1,12 @@
 name: pipeline
 
-# Scheduled end-to-end run: scrape -> entity resolution -> descriptions ->
-# sentiment -> valuation -> phone push. This repo is public, so Actions minutes
-# are free. State (raw scrapes, descriptions, embedding cache, the notify
-# exactly-once DB) is carried between runs in the `pipeline-data-*` cache.
+# Hourly scan: scrape (SW Ontario) -> observation log -> INCREMENTAL entity
+# resolution (assign to the frozen clusters from the weekly `retrain` job, no
+# re-clustering) -> descriptions -> sentiment -> valuation -> phone push.
+# Public repo => free Actions minutes. State (raw scrapes, descriptions,
+# embedding cache, observation log, model snapshot, notify exactly-once DB) is
+# carried between runs in the `pipeline-data-*` cache. The heavy re-cluster +
+# label checkpoint lives in retrain.yml (weekly).
 
 on:
   schedule:

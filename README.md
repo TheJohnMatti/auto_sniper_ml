@@ -178,26 +178,37 @@ released for retry). Point `$NOTIFY_DB` at a mounted volume in a container.
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
 
-## ☁️ Deployment (scheduled GitHub Action)
+## ☁️ Deployment (scheduled GitHub Actions)
 
-`.github/workflows/pipeline.yml` runs the whole chain
-(`scripts/run_once.sh`: scrape → entity resolution → descriptions → sentiment →
-valuation → notify) **hourly** on a GitHub-hosted runner. The repo is public so
-Actions minutes are free. The scrape is one southwestern-Ontario pass
-(`scraping.locations`), so a run is only a few minutes.
+Two workflows, one shared `concurrency` group so they never run at once:
+
+| Workflow | Cadence | What it does |
+|---|---|---|
+| `pipeline.yml` | **hourly** | scrape (SW Ontario) → observation log → **incremental** entity resolution (assign to frozen clusters, no re-cluster) → descriptions → sentiment → valuation → notify |
+| `retrain.yml` | **weekly** (Mon 08:00 UTC) | same chain but `FULL_RETRAIN=1` — re-clusters the entity model over the **whole accumulated corpus**, refreshes the model snapshot the hourly job assigns against, and reports which clusters need labeling |
+
+Both call `scripts/run_once.sh`. The split keeps entity definitions — and so
+"what counts as a deal" — stable between weekly rebuilds, and makes cluster
+labeling a weekly checkpoint instead of an hourly ask.
+
+**Continuous training.** `src/ml/observe.py` writes an append-only
+`observations.sqlite3` every run: one row per (listing, sighting), plus a
+`listing_history` table with first/last-seen, the price path, and a `gone_at`
+(sold / delisted / aged out). Weeks of this give price-trajectory features and a
+sold-vs-not label — the substrate for a learned deal classifier that the weekly
+retrain will train once there's enough history (not built yet; the z-score +
+lexicon rules are the current scorer and become its features).
 
 **Why not Vercel / a serverless cron:** the pipeline needs `torch` +
 `sentence-transformers` (~1 GB, over Vercel's 250 MB function limit), a real
-Chromium for Playwright, and a persistent disk for the notify state DB — none of
-which serverless provides. A GitHub Action gets a full VM and is itself a cron.
+Chromium for Playwright, and a persistent disk for the state DBs — none of which
+serverless provides. A GitHub Action gets a full VM and is itself a cron.
 
-**Cadence:** GitHub's scheduler is best-effort (a `* * * *` job often fires
-5–15 min late, and can be skipped under load). For true ~5-minute *sniper*
-latency, run just the lightweight scanner (feed scrape → match against the last
-full model → notify, no `torch`) as an always-on loop on a small always-free VM
-(Oracle Cloud / Fly.io), and keep this Action as the weekly heavy rebuild. That
-split isn't built yet — the hourly Action is the current whole-pipeline
-deployment.
+**Cadence caveat:** GitHub's scheduler is best-effort (a `* * * *` job often
+fires 5–15 min late, and can be skipped under load). For true ~5-minute *sniper*
+latency, run a lightweight torch-free scanner (feed scrape → match against the
+frozen model → notify) as an always-on loop on a small always-free VM (Oracle
+Cloud / Fly.io) and keep these Actions as the rebuild + fallback. Not built yet.
 
 **Secrets** are GitHub Actions repo secrets (encrypted, never in code / logs /
 PRs). `NTFY_TOPIC` is already set; add `NTFY_TOKEN` too if you move to a
@@ -208,15 +219,16 @@ gh secret set NTFY_TOPIC        # your long random topic (also in local .env)
 gh secret set NTFY_TOKEN        # optional
 ```
 
-Then enable Actions for the repo. The schedule starts on its own; use **Run
-workflow** (`workflow_dispatch`) for a manual run — it has `skip_scrape` /
-`skip_descriptions` toggles.
+Then enable Actions for the repo. The schedules start on their own; use **Run
+workflow** (`workflow_dispatch`) for a manual run — `pipeline` has `skip_scrape`
+/ `skip_descriptions` toggles.
 
 **State between runs** lives in the `pipeline-data-*` Actions cache (`data/` —
-raw scrapes, `descriptions.csv`, the embedding cache, and `notified.sqlite3`).
-The cron never idles long enough for the 7-day cache eviction to bite; if it
-does, the next run rebuilds from scratch and may re-notify current deals once.
-`deals.csv` / `valuation.csv` are also uploaded as a run artifact (14 days).
+raw scrapes, `descriptions.csv`, embedding cache, `observations.sqlite3`, the
+frozen model snapshot, `notified.sqlite3`). Hourly runs mean the 7-day cache
+eviction never bites; if it does, the next run rebuilds from scratch and may
+re-notify current deals once. `deals.csv` / `valuation.csv` upload as run
+artifacts.
 
 **Caveats:**
 
@@ -234,7 +246,8 @@ does, the next run rebuilds from scratch and may re-notify current deals once.
   (`[data-virtualized='false']`) and scroll behaviour on that route need a real
   smoke-test run. `_extract_listings` fails soft (logs, returns nothing) if the
   selector has rotted.
-- **Label drift:** clustering is re-run each time, so as the listing population
-  churns, cluster ids shift and the curated `data/clusters/label_map.json`
-  gradually stops matching (clusters fall back to the heuristic label). Re-run
-  the `label-clusters` skill and commit a fresh `label_map.json` every few weeks.
+- **Label upkeep:** the weekly `retrain` re-clusters and writes a fresh
+  `label_requests.json`; new clusters fall back to the heuristic label until you
+  run the `label-clusters` skill and commit an updated `label_map.json`. The
+  retrain run logs a `::warning::` with the count of clusters still heuristic.
+  Hourly runs don't re-cluster, so labels are stable within a week.

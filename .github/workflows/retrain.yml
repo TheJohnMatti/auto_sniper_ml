@@ -1,0 +1,108 @@
+name: retrain
+
+# Weekly heavy pass: re-cluster the entity model from scratch over the WHOLE
+# accumulated corpus (every title ever scraped, via the observation log +
+# data/raw cache), refresh valuation baselines, and snapshot the model that the
+# hourly `pipeline` workflow then assigns against incrementally.
+#
+# Kept separate from the hourly job so entity definitions - and therefore "what
+# counts as a deal" - stay stable between rebuilds, and so cluster labeling is a
+# weekly checkpoint rather than an hourly ask.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"        # Mondays 08:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: pipeline               # same group as the hourly job - never run both at once
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Restore pipeline data
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: pipeline-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            pipeline-data-
+
+      - name: Cache model downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: models-${{ hashFiles('config.yaml') }}
+          restore-keys: |
+            models-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          python -m playwright install --with-deps chromium
+
+      - name: Full retrain (scrape + observe + re-cluster + valuation + notify)
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          FULL_RETRAIN: "1"
+        run: bash scripts/run_once.sh
+
+      - name: Label + corpus status
+        run: |
+          python - <<'PY'
+          import pandas as pd, sqlite3, os
+          cl = pd.read_csv("data/clusters/cluster_labels.csv")
+          m = cl["label_method"].value_counts().to_dict()
+          print(f"clusters: {m}")
+          heur = int(m.get("heuristic", 0))
+          if heur:
+              print(f"::warning::{heur} clusters are heuristic-labeled - run the "
+                    f"`label-clusters` skill on data/clusters/label_requests.json "
+                    f"and commit data/clusters/label_map.json")
+          if os.path.exists("data/processed/observations.sqlite3"):
+              c = sqlite3.connect("data/processed/observations.sqlite3")
+              obs, listings, gone = c.execute(
+                  "SELECT (SELECT COUNT(*) FROM observations),"
+                  " (SELECT COUNT(*) FROM listing_history),"
+                  " (SELECT COUNT(gone_at) FROM listing_history)").fetchone()
+              print(f"corpus: {obs} sightings, {listings} listings, {gone} gone "
+                    f"(candidate sold/not-sold labels for the deal classifier)")
+          PY
+
+      - name: Persist pipeline data
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: pipeline-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload retrain snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrain-${{ github.run_id }}
+          path: |
+            data/clusters/cluster_labels.csv
+            data/clusters/label_requests.json
+            data/processed/deals.csv
+            data/processed/valuation.csv
+          if-no-files-found: ignore
+          retention-days: 30
