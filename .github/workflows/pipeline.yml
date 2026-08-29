@@ -7,7 +7,10 @@ name: pipeline
 
 on:
   schedule:
-    - cron: "17 */6 * * *"      # every 6h, at :17 past (off-hour = less queue drift)
+    - cron: "27 * * * *"        # hourly at :27. One SW-Ontario scrape is quick;
+                                # GitHub's scheduler is best-effort (often 5-15 min
+                                # late). For true 5-min sniping, run the scanner as
+                                # an always-on loop on a small VM instead (see README).
   workflow_dispatch:
     inputs:
       skip_scrape:
