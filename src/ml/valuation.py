@@ -192,7 +192,7 @@ def attach_signals(scored: pd.DataFrame, path: str = SIGNALS_PATH) -> pd.DataFra
 
     # a dealer ad / "we buy cars" post is never a deal, however cheap it looks
     scored.loc[scored["is_dealer_or_ad"], "is_deal"] = False
-    return flag_stale(flag_outliers(scored))
+    return flag_region(flag_stale(flag_outliers(scored)))
 
 
 def flag_outliers(scored: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
@@ -255,6 +255,25 @@ def flag_stale(scored: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     return scored
 
 
+def flag_region(scored: pd.DataFrame) -> pd.DataFrame:
+    """Production only surfaces deals in the configured region (SW Ontario).
+
+    Comps / baselines still use every scraped listing - only `is_deal` (and
+    therefore notifications) is gated. A listing with no parsed "Town, PROV"
+    line falls back to its scrape `location` tag.
+    """
+    from src.ml.geo import in_region
+
+    loc = scored.get("raw_listing_location")
+    if loc is None:
+        loc = pd.Series("", index=scored.index)
+    loc = loc.astype(str).str.strip()
+    loc = loc.where(loc.ne(""), scored.get("location", pd.Series("", index=scored.index)))
+    scored["in_region"] = loc.map(in_region)
+    scored.loc[~scored["in_region"], "is_deal"] = False
+    return scored
+
+
 def main() -> None:
     if not os.path.exists(LABELED_PATH):
         raise FileNotFoundError(f"{LABELED_PATH} not found. Run `python -m src.ml.run_pipeline` first.")
@@ -267,7 +286,7 @@ def main() -> None:
         "entity_label", "price", "entity_median", "mileage_adj_price",
         "odometer_km", "mileage_known", "listing_age_days", "discount_pct",
         "raw_discount_pct", "robust_z", "entity_comps", "deal_score", "is_deal",
-        "is_suspect", "is_outlier", "is_stale", "seller_marked_down",
+        "is_suspect", "is_outlier", "is_stale", "in_region", "seller_marked_down",
         "has_description", "condition_score", "urgency_score", "red_flags",
         "is_dealer_or_ad", "price_not_sale_cues", "raw_price_original",
         "location", "raw_listing_location", "url",
@@ -294,6 +313,8 @@ def main() -> None:
     print(f"[+] {len(deals)} deals, {int(scored['is_suspect'].sum())} suspect, "
           f"{int(scored['is_outlier'].sum())} outlier (too good to be true), "
           f"{int(scored['is_stale'].sum())} stale (on market too long)")
+    print(f"[+] {int(scored['in_region'].sum())}/{len(scored)} listings in region; "
+          f"deals outside the region are dropped ({int((~scored['in_region']).sum())} excluded)")
     print(f"[+] Wrote {valuation_path} and {deals_path}")
 
     if len(deals):

@@ -6,11 +6,22 @@ scraping:
   # Per-run cap for the incremental detail-page description scrape
   # (src/scraper/fetch_descriptions.py). Resumes where it left off each run.
   description_batch_size: 150
-  targets:
-    - platform: "facebook_marketplace"
-      base_url: "https://www.facebook.com/marketplace/toronto/cars/"
-    - platform: "kijiji"
-      base_url: "https://www.kijiji.ca/b-cars-trucks/gta-greater-toronto-area/"
+
+  # Where to scrape. Each entry is either:
+  #   - a Facebook Marketplace city slug ({slug: windsor}) - only works for the
+  #     ~hundreds of cities FB has a named route for, and
+  #   - a lat/long + radius ({latitude:, longitude:, radius_km:}) - works for
+  #     ANY point. London, ON has no slug (/marketplace/london/ is London, UK),
+  #     so it must be targeted by coordinates via /marketplace/category/vehicles.
+  # `name` is the tag written to the `location` column. sortBy=creation_time_descend
+  # (newest first) is always appended so each scan sees fresh listings before the
+  # ~100-listing unauthenticated wall.
+  locations:
+    - name: london_swon
+      latitude: 42.9849       # London, ON city hall
+      longitude: -81.2453
+      radius_km: 100          # covers London, St Thomas, Woodstock, Ingersoll,
+                              # Strathroy, Tillsonburg, Stratford, Sarnia, Chatham
 
 ml_pipeline:
   embeddings:
@@ -32,6 +43,15 @@ ml_pipeline:
     # the agent) turns them into data/clusters/label_map.json. Clusters without a
     # curated label fall back to a deterministic token-frequency heuristic.
     samples_per_cluster: 10
+
+  inference:
+    # Production only surfaces deals in southwestern Ontario. A listing is kept
+    # if the town in its "Town, PROV" line is within radius_km of `center`
+    # (see src/ml/geo.py); comps/baselines are still built from everything
+    # scraped. Widen the radius slightly vs the scrape so edge towns aren't lost.
+    region:
+      center: [42.9849, -81.2453]   # London, ON
+      radius_km: 115
 
   valuation:
     # Phase 2: robust (median/MAD) z-score anomaly detection per year+model entity.

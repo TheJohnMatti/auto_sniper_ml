@@ -8,7 +8,7 @@ This project abandons the anti-pattern of passing raw, chaotic marketplace data 
 
 ### Phase 1: Entity Resolution (Unsupervised + Agent Synthesis)
 
-1. **Scraping Engine:** Utilizes `Playwright` to navigate the JavaScript-heavy DOMs of Facebook Marketplace and Kijiji, extracting raw vehicle listing strings.
+1. **Scraping Engine:** Uses `Playwright` to navigate the JavaScript-heavy DOM of Facebook Marketplace, extracting raw vehicle listing strings. Targets are `scraping.locations` in `config.yaml` — either a Facebook city slug or, for a point Facebook has no named route for (London, ON — `/marketplace/london/` is London **UK**), a `latitude`/`longitude`/`radius_km` on `/marketplace/category/vehicles`. Always sorted newest-first.
 
 2. **Vectorization:** Converts messy, user-generated titles (e.g., `"2014 hnda civc manual"`) into dense semantic embeddings using `sentence-transformers`.
 
@@ -182,24 +182,35 @@ released for retry). Point `$NOTIFY_DB` at a mounted volume in a container.
 
 `.github/workflows/pipeline.yml` runs the whole chain
 (`scripts/run_once.sh`: scrape → entity resolution → descriptions → sentiment →
-valuation → notify) every 6 hours on a GitHub-hosted runner. The repo is public
-so Actions minutes are free.
+valuation → notify) **hourly** on a GitHub-hosted runner. The repo is public so
+Actions minutes are free. The scrape is one southwestern-Ontario pass
+(`scraping.locations`), so a run is only a few minutes.
 
 **Why not Vercel / a serverless cron:** the pipeline needs `torch` +
 `sentence-transformers` (~1 GB, over Vercel's 250 MB function limit), a real
 Chromium for Playwright, and a persistent disk for the notify state DB — none of
 which serverless provides. A GitHub Action gets a full VM and is itself a cron.
 
-**Setup:**
+**Cadence:** GitHub's scheduler is best-effort (a `* * * *` job often fires
+5–15 min late, and can be skipped under load). For true ~5-minute *sniper*
+latency, run just the lightweight scanner (feed scrape → match against the last
+full model → notify, no `torch`) as an always-on loop on a small always-free VM
+(Oracle Cloud / Fly.io), and keep this Action as the weekly heavy rebuild. That
+split isn't built yet — the hourly Action is the current whole-pipeline
+deployment.
 
-1. Add the ntfy topic as a repo secret (never commit it — public repo):
-   ```bash
-   gh secret set NTFY_TOPIC        # paste your long random topic
-   gh secret set NTFY_TOKEN        # optional: only for protected / self-hosted
-   ```
-2. Enable Actions for the repo. The schedule starts on its own; use
-   **Run workflow** (`workflow_dispatch`) for a manual run — it has
-   `skip_scrape` / `skip_descriptions` toggles.
+**Secrets** are GitHub Actions repo secrets (encrypted, never in code / logs /
+PRs). `NTFY_TOPIC` is already set; add `NTFY_TOKEN` too if you move to a
+protected or self-hosted ntfy topic:
+
+```bash
+gh secret set NTFY_TOPIC        # your long random topic (also in local .env)
+gh secret set NTFY_TOKEN        # optional
+```
+
+Then enable Actions for the repo. The schedule starts on its own; use **Run
+workflow** (`workflow_dispatch`) for a manual run — it has `skip_scrape` /
+`skip_descriptions` toggles.
 
 **State between runs** lives in the `pipeline-data-*` Actions cache (`data/` —
 raw scrapes, `descriptions.csv`, the embedding cache, and `notified.sqlite3`).
@@ -209,10 +220,20 @@ does, the next run rebuilds from scratch and may re-notify current deals once.
 
 **Caveats:**
 
+- **Region gate:** production only surfaces deals whose town is within
+  `ml_pipeline.inference.region.radius_km` of London, ON (`src/ml/geo.py`).
+  Comps/baselines still use everything scraped. Widen `radius_km` (or the scrape
+  radius) to include Windsor-Essex.
 - **Facebook may block the runner's datacenter IP** for unauthenticated
   Marketplace requests. If scrapes come back empty, run the scraper from a
-  residential IP (locally or a small VPS) and let the Action do everything after
-  `--skip-scrape`, or add a proxy.
+  residential IP (locally or a small VPS) and let the Action do everything with
+  `skip_scrape`, or add a proxy.
+- **Coordinate scrape is unverified against live Facebook** from this
+  environment: `/marketplace/category/vehicles?latitude=…&longitude=…&radius=…`
+  is confirmed to resolve to "London, Ontario", but the card selector
+  (`[data-virtualized='false']`) and scroll behaviour on that route need a real
+  smoke-test run. `_extract_listings` fails soft (logs, returns nothing) if the
+  selector has rotted.
 - **Label drift:** clustering is re-run each time, so as the listing population
   churns, cluster ids shift and the curated `data/clusters/label_map.json`
   gradually stops matching (clusters fall back to the heuristic label). Re-run

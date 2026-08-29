@@ -2,12 +2,41 @@ import asyncio
 import csv
 import os
 import re
+import urllib.parse
 from datetime import datetime
 
 from playwright.async_api import async_playwright, Page
 
+from src.ml.config import load_config
+
 # Ensure our raw data directory exists
 OUTPUT_DIR = "data/raw"
+
+# Newest-first so each scan sees fresh listings before the ~100-item wall.
+_SORT_PARAM = "sortBy=creation_time_descend"
+
+
+def build_start_url(loc: dict) -> tuple[str, str]:
+    """A `scraping.locations` entry -> (start_url, location_tag).
+
+    `{slug: windsor}`                         -> /marketplace/windsor/cars/
+    `{latitude:, longitude:, radius_km:}`     -> /marketplace/category/vehicles?lat&lng&radius
+                                                (the only way to target a point
+                                                FB has no named route for, e.g. London ON)
+    """
+    if loc.get("slug"):
+        tag = loc.get("name", loc["slug"])
+        return f"https://www.facebook.com/marketplace/{loc['slug']}/cars/?{_SORT_PARAM}", tag
+    if loc.get("latitude") is not None and loc.get("longitude") is not None:
+        tag = loc.get("name") or f"{loc['latitude']}_{loc['longitude']}"
+        q = urllib.parse.urlencode({
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "radius": loc.get("radius_km", 65),
+            "exact": "false",
+        })
+        return f"https://www.facebook.com/marketplace/category/vehicles?{q}&{_SORT_PARAM}", tag
+    raise ValueError(f"scraping.locations entry needs `slug` or `latitude`/`longitude`: {loc!r}")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Matches a Facebook Marketplace price token, e.g. "CA$3,200", "$1,500", "CA$12,999.00", "Free"
@@ -202,60 +231,26 @@ class MarketplaceScraper:
 
 
 async def main():
-    # Curated list of validated, uniquely Canadian cities (see clean_invalid_cities.py)
-    cities = [
-        "toronto",
-        "ottawa",
-        "hamilton",
-        "windsor",
-        "vancouver",
-        "victoria",
-        "nanaimo",
-        "calgary",
-        "edmonton",
-        "saskatoon",
-        "regina",
-        "winnipeg",
-        "montreal",
-        "quebec",
-        "halifax",
-    ]
+    selectors = {"card": "[data-virtualized='false']"}
+    locations = load_config()["scraping"].get("locations") or []
+    if not locations:
+        raise SystemExit("config.yaml scraping.locations is empty - nothing to scrape.")
 
-    # Define platform-specific configurations
-    platforms = {
-        "facebook": {
-            # Use {city} as a placeholder to be formatted in the loop
-            "url_template": "https://www.facebook.com/marketplace/{city}/cars/",
-            "selectors": {
-                "card": "[data-virtualized='false']",
-            },
-        }
-    }
+    for loc in locations:
+        start_url, tag = build_start_url(loc)
+        print("\n==================================================")
+        print(f"[*] Starting scrape: {tag}  ({start_url})")
+        print("==================================================")
 
-    # You can comment out platforms here to test them one by one
-    targets_to_run = ["facebook"]
+        scraper = MarketplaceScraper(
+            platform_name="facebook",
+            selectors=selectors,
+            location=tag,
+        )
+        await scraper.run(start_url)
 
-    for platform_name in targets_to_run:
-        config = platforms[platform_name]
-
-        for city in cities:
-            print("\n==================================================")
-            print(f"[*] Starting scrape for: {platform_name.upper()} - {city.upper()}")
-            print("==================================================")
-
-            # Construct the dynamic URL for the current city
-            start_url = config["url_template"].format(city=city)
-
-            scraper = MarketplaceScraper(
-                platform_name=platform_name,
-                selectors=config["selectors"],
-                location=city,
-            )
-            await scraper.run(start_url)
-
-            # A short sleep between locations to avoid triggering aggressive bot detection
-            print(f"[*] Finished {city}. Sleeping for 5 seconds before next location...")
-            await asyncio.sleep(5)
+        print(f"[*] Finished {tag}. Sleeping 5s before next location...")
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
