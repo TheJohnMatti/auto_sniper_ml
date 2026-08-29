@@ -45,3 +45,20 @@ ml_pipeline:
     outlier_ratio: 0.25       # price below this * raw median => implausible discount
     outlier_z: -4.0           # ...or robust z at/below this
     project_car_floor: 400    # a severe-flag car (salvage/blown engine) this cheap is a real listing, not an outlier
+
+  notifications:
+    # Phone push for fresh deals via ntfy (https://ntfy.sh) - no account/API key.
+    # `python -m src.ml.notify` after each valuation run; state in
+    # data/processed/notified.json keeps re-runs / cron from spamming.
+    enabled: true
+    min_deal_score: 0.6       # don't notify below this deal_score
+    max_per_run: 10           # cap per invocation; the rest go on the next run
+    ntfy:
+      # This repo is PUBLIC - the real topic must NOT live here. Put it in a
+      # local .env (gitignored):  NTFY_TOPIC=a-long-random-string
+      # Optional: NTFY_SERVER (self-hosted URL), NTFY_TOKEN (protected topics).
+      # Public ntfy.sh topics are unauthenticated - anyone who knows the name can
+      # read and post to them, hence "long and random".
+      server: "https://ntfy.sh"
+      topic: "auto-sniper-changeme-set-NTFY_TOPIC-in-dotenv"
+      priority_threshold: 0.9  # deal_score >= this => high-priority (louder) push

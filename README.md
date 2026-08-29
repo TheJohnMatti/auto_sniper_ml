@@ -55,7 +55,13 @@ brakes / one owner* vs. red flags like *as-is / head gasket / needs work*), an
 `urgency_score`, and a `is_dealer_or_ad` flag. `valuation.py` folds these into a
 combined `deal_score` and drops dealer/ad posts from the deal list.
 
-Push notifications for high-`deal_score` listings are the remaining TODO.
+### Phase 3: Notifications
+
+`src/ml/notify.py` pushes each fresh `deals.csv` row above a `deal_score`
+threshold to your phone via [ntfy](https://ntfy.sh) (no account / API key — a
+notification is just an HTTP POST to a topic). A local `notified.json` state file
+dedupes across runs so it's cron-safe. High-`deal_score` deals get an elevated
+(louder) priority.
 
 ## 🚀 Getting Started
 
@@ -130,6 +136,28 @@ Push notifications for high-`deal_score` listings are the remaining TODO.
    script loops it in spaced batches until the queue drains, then runs
    `sentiment` (→ `data/processed/listing_signals.csv`) and re-runs `valuation`
    to fold the signals into `deal_score`.
+
+8. **Get pushed the deals** (Phase 3):
+
+   ```bash
+   poetry run python -m src.ml.notify --dry-run   # preview
+   poetry run python -m src.ml.notify             # push new ones to your phone
+   ```
+
+   Sends each fresh `deals.csv` row with `deal_score ≥ min_deal_score` as an
+   [ntfy](https://ntfy.sh) notification — no account, no API key. Because this
+   repo is public, the topic lives in a local `.env` (gitignored), not
+   `config.yaml`:
+
+   ```bash
+   echo "NTFY_TOPIC=$(python -c 'import secrets;print("auto-sniper-"+secrets.token_urlsafe(18))')" >> .env
+   ```
+
+   Install the ntfy app (iOS / Android / web), add a subscription to that exact
+   topic name on server `ntfy.sh`, and you're done. `NTFY_SERVER` / `NTFY_TOKEN`
+   env vars cover self-hosted or protected topics. State in
+   `data/processed/notified.json` means cron / re-runs never double-send;
+   `--all` ignores it, `--min-score` / `--limit` override the config.
 
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
