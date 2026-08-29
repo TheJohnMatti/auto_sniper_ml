@@ -14,12 +14,32 @@ Output: data/processed/listing_signals.csv   (one row per listing with a descrip
 """
 import os
 import re
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 DESCRIPTIONS_PATH = "data/raw/descriptions.csv"
 SIGNALS_PATH = "data/processed/listing_signals.csv"
+
+# Facebook renders "Listed 3 weeks ago" / "Listed a day ago" / "Just listed".
+_AGE_RE = re.compile(
+    r"(?:listed\s+)?(?:(\d+)|(a|an))\s*(hour|day|week|month|year)s?\s*ago", re.I
+)
+_AGE_UNIT_DAYS = {"hour": 1 / 24, "day": 1.0, "week": 7.0, "month": 30.0, "year": 365.0}
+
+
+def parse_listed_age(text: str) -> float | None:
+    """'Listed 3 weeks ago' -> 21.0 days. 'Just listed' -> 0.0. Unknown -> None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if re.search(r"just listed|listed today|moments ago", text, re.I):
+        return 0.0
+    m = _AGE_RE.search(text)
+    if not m:
+        return None
+    qty = 1.0 if m.group(2) else float(m.group(1))
+    return round(qty * _AGE_UNIT_DAYS[m.group(3).lower()], 2)
 
 # --- lexicons -----------------------------------------------------------------
 # Each entry: label -> regex (matched case-insensitively against the description).
@@ -88,11 +108,21 @@ def _load_descriptions(path: str = DESCRIPTIONS_PATH) -> pd.DataFrame:
     return df
 
 
-def score_descriptions(df: pd.DataFrame) -> pd.DataFrame:
+def score_descriptions(df: pd.DataFrame, now: datetime | None = None) -> pd.DataFrame:
+    now = now or datetime.now(timezone.utc)
     rows = []
     for r in df.itertuples(index=False):
         text = r.raw_description
         has = bool(text) and r.status != "empty"
+
+        # age on the market: what the page said when we scraped it, plus however
+        # long ago that scrape was (so re-running months later stays honest).
+        age_at_scrape = parse_listed_age(getattr(r, "listed_age", ""))
+        listing_age_days = None
+        if age_at_scrape is not None:
+            fetched = pd.to_datetime(getattr(r, "fetched_at", None), utc=True, errors="coerce")
+            since_scrape = 0.0 if pd.isna(fetched) else max(0.0, (now - fetched).total_seconds() / 86400)
+            listing_age_days = round(age_at_scrape + since_scrape, 2)
 
         n_red, red = _count_hits(text, RED_FLAGS)
         n_pos, pos = _count_hits(text, POSITIVES)
@@ -129,6 +159,7 @@ def score_descriptions(df: pd.DataFrame) -> pd.DataFrame:
             "odometer_km": r.odometer_km,
             "transmission": r.transmission,
             "listed_age": r.listed_age,
+            "listing_age_days": listing_age_days,
         })
     return pd.DataFrame(rows)
 
@@ -152,6 +183,8 @@ def main() -> None:
     print(f"    positive condition : {int((scored['condition_score'] > 0.2).sum())}")
     print(f"    negative condition : {int((scored['condition_score'] < -0.2).sum())}")
     print(f"    urgent seller      : {int((scored['urgency_score'] >= 0.33).sum())}")
+    age = pd.to_numeric(signals["listing_age_days"], errors="coerce")
+    print(f"    age known / >30d   : {int(age.notna().sum())} / {int((age > 30).sum())}")
 
     worst = scored.nsmallest(8, "condition_score")[["item_id", "condition_score", "red_flags"]]
     best = scored.nlargest(8, "condition_score")[["item_id", "condition_score", "positives"]]

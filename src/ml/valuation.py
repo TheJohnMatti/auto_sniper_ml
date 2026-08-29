@@ -154,6 +154,7 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
 _SIGNAL_COLS = [
     "has_description", "condition_score", "urgency_score", "red_flag_count",
     "red_flags", "is_dealer_or_ad", "price_not_sale_price", "price_not_sale_cues",
+    "listing_age_days",
 ]
 
 
@@ -171,20 +172,27 @@ def attach_signals(scored: pd.DataFrame, path: str = SIGNALS_PATH) -> pd.DataFra
         if col not in scored.columns:
             scored[col] = default
         scored[col] = scored[col].fillna(default)
+    if "listing_age_days" not in scored.columns:
+        scored["listing_age_days"] = np.nan
+    scored["listing_age_days"] = pd.to_numeric(scored["listing_age_days"], errors="coerce")
 
     # how far below market, capped so a 3-comp blowup doesn't dominate
     underpricing = (scored["discount_pct"] / 0.5).clip(0.0, 1.0)
+    # recency: a real underpriced car sells fast, so fresh listings are worth more.
+    # +0.15 at <=2d fading to 0 by ~3 weeks; unknown age is neutral.
+    recency = (1.0 - scored["listing_age_days"].fillna(7.0) / 21.0).clip(-0.5, 1.0) * 0.15
     scored["deal_score"] = (
         underpricing
         + 0.30 * scored["condition_score"]
         + 0.10 * scored["urgency_score"]
+        + recency
         - 0.15 * scored["red_flag_count"].clip(upper=4)
         - 0.50 * scored["is_dealer_or_ad"].astype(float)
     ).round(3)
 
     # a dealer ad / "we buy cars" post is never a deal, however cheap it looks
     scored.loc[scored["is_dealer_or_ad"], "is_deal"] = False
-    return flag_outliers(scored)
+    return flag_stale(flag_outliers(scored))
 
 
 def flag_outliers(scored: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
@@ -224,6 +232,29 @@ def flag_outliers(scored: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame
     return scored
 
 
+def flag_stale(scored: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    """Drop deals that have sat on the market too long to still be real.
+
+    A genuinely underpriced car is gone in days. Anything still listed after
+    weeks - especially something that *looks* like a steal - has a reason it
+    hasn't sold (bad title, hidden damage, phantom listing, wrong price). We
+    only have an age for listings whose description page was scraped; unknown
+    age is treated as fresh (other signals still apply).
+    """
+    cfg = cfg or ml_config()["valuation"]
+    max_age = float(cfg.get("max_listing_age_days", 45))
+    steal_age = float(cfg.get("stale_steal_days", 14))
+    steal_discount = float(cfg.get("stale_steal_discount", 0.45))
+
+    age = scored["listing_age_days"]
+    scored["is_stale"] = (age > max_age) | (
+        (age > steal_age) & (scored["discount_pct"] >= steal_discount)
+    )
+    scored["is_stale"] = scored["is_stale"].fillna(False)
+    scored.loc[scored["is_stale"], "is_deal"] = False
+    return scored
+
+
 def main() -> None:
     if not os.path.exists(LABELED_PATH):
         raise FileNotFoundError(f"{LABELED_PATH} not found. Run `python -m src.ml.run_pipeline` first.")
@@ -234,11 +265,12 @@ def main() -> None:
 
     cols = [
         "entity_label", "price", "entity_median", "mileage_adj_price",
-        "odometer_km", "mileage_known", "discount_pct", "raw_discount_pct",
-        "robust_z", "entity_comps", "deal_score", "is_deal", "is_suspect",
-        "is_outlier", "seller_marked_down", "has_description", "condition_score",
-        "urgency_score", "red_flags", "is_dealer_or_ad", "price_not_sale_cues",
-        "raw_price_original", "location", "raw_listing_location", "url",
+        "odometer_km", "mileage_known", "listing_age_days", "discount_pct",
+        "raw_discount_pct", "robust_z", "entity_comps", "deal_score", "is_deal",
+        "is_suspect", "is_outlier", "is_stale", "seller_marked_down",
+        "has_description", "condition_score", "urgency_score", "red_flags",
+        "is_dealer_or_ad", "price_not_sale_cues", "raw_price_original",
+        "location", "raw_listing_location", "url",
     ]
     cols = [c for c in cols if c in scored.columns]
     valuation_path = os.path.join(PROCESSED_DIR, "valuation.csv")
@@ -260,7 +292,8 @@ def main() -> None:
     print(f"[+] {n_desc} listings have a scraped description; "
           f"{int(scored['is_dealer_or_ad'].sum())} flagged dealer/ad")
     print(f"[+] {len(deals)} deals, {int(scored['is_suspect'].sum())} suspect, "
-          f"{int(scored['is_outlier'].sum())} outlier (too good to be true, kept but not a deal)")
+          f"{int(scored['is_outlier'].sum())} outlier (too good to be true), "
+          f"{int(scored['is_stale'].sum())} stale (on market too long)")
     print(f"[+] Wrote {valuation_path} and {deals_path}")
 
     if len(deals):
@@ -268,12 +301,13 @@ def main() -> None:
             price=lambda d: d["price"].map("${:,.0f}".format),
             median=lambda d: d["entity_median"].map("${:,.0f}".format),
             km=lambda d: d["odometer_km"].map(lambda v: "-" if pd.isna(v) else f"{v/1000:.0f}k"),
+            age=lambda d: d["listing_age_days"].map(lambda v: "-" if pd.isna(v) else f"{v:.0f}d"),
             off=lambda d: (d["discount_pct"] * 100).map("{:.0f}%".format),
             cond=lambda d: d["condition_score"].map("{:+.2f}".format),
         )
-        print("\nTop deals (by deal_score, discount is mileage-adjusted):")
-        print(show[["entity_label", "price", "median", "km", "off", "deal_score", "cond",
-                    "red_flags", "entity_comps", "location"]].to_string(index=False))
+        print("\nTop deals (by deal_score; discount mileage-adjusted):")
+        print(show[["entity_label", "price", "median", "km", "age", "off", "deal_score",
+                    "cond", "red_flags", "entity_comps", "location"]].to_string(index=False))
 
     outliers = scored[scored["is_outlier"]].sort_values("price")
     if len(outliers):

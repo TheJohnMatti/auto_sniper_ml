@@ -9,17 +9,21 @@ opens the listing.
     python -m src.ml.notify                 # send everything new since last run
     python -m src.ml.notify --dry-run       # print what would be sent, send nothing
     python -m src.ml.notify --min-score 0.9 --limit 5
-    python -m src.ml.notify --all           # ignore the "already sent" state
+    python -m src.ml.notify --all           # re-send even things already notified
 
-Reads:  data/processed/deals.csv         (from src.ml.valuation - already filtered
-                                          of suspects / outliers / dealer ads)
-State:  data/processed/notified.json     item_ids already pushed, so re-runs and
-                                          cron don't spam you
+Reads:  data/processed/deals.csv     (from src.ml.valuation - already filtered of
+                                      suspects / outliers / dealer ads / stale)
+State:  SQLite at $NOTIFY_DB (default data/processed/notified.sqlite3). A row
+        with `sent_at` set is NEVER sent again - the DB's PRIMARY KEY + a
+        claim-before-send handshake make that hold even with overlapping cron
+        runs or a crash mid-send. In a container, point NOTIFY_DB at a mounted
+        volume so the guarantee survives restarts.
 Config: ml_pipeline.notifications in config.yaml (thresholds, defaults)
 Env:    NTFY_TOPIC   your topic - REQUIRED; overrides config.yaml. This repo is
                      public, so the real topic goes in a local .env, not a file.
         NTFY_SERVER  default https://ntfy.sh; set for a self-hosted server
         NTFY_TOKEN   only for protected / self-hosted topics
+        NOTIFY_DB    path to the state DB (see above)
 A local .env is auto-loaded if python-dotenv is installed.
 
 Topics on the public ntfy.sh server are unauthenticated - anyone who knows the
@@ -31,10 +35,11 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -48,9 +53,24 @@ except ImportError:
 from src.ml.config import ml_config
 
 DEALS_PATH = "data/processed/deals.csv"
-STATE_PATH = "data/processed/notified.json"
+DEFAULT_DB_PATH = "data/processed/notified.sqlite3"
+LEGACY_JSON_PATH = "data/processed/notified.json"
 _ITEM_ID_RE = re.compile(r"/marketplace/item/(\d+)")
-_STATE_TTL_DAYS = 60  # forget sent item_ids older than this so the file stays small
+_PRUNE_AFTER_DAYS = 180        # drop delivered rows older than this (relists get new ids)
+_STALE_CLAIM_SECONDS = 3600    # an unsent claim older than this = a crashed run; reclaim it
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _age_seconds(iso: str | None) -> float:
+    if not iso:
+        return float("inf")
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return float("inf")
 
 
 # --- config -----------------------------------------------------------------
@@ -84,41 +104,109 @@ def _cfg() -> dict:
     }
 
 
-# --- state ------------------------------------------------------------------
+# --- state store (SQLite) --------------------------------------------------
+#
+# One row per item_id. `sent_at IS NOT NULL` == delivered, and that is a
+# permanent, idempotent record: claim() will never hand the same item out for
+# sending twice. The flow per item is:
+#
+#   claim()      INSERT OR IGNORE; we own it iff we inserted the row (or the
+#                existing row is an abandoned, unsent claim we then steal).
+#   mark_sent()  stamp sent_at once ntfy accepted it.
+#   release()    delete our unsent claim if the POST failed, so it retries next run.
 
-def _load_state(path: str = STATE_PATH) -> dict:
-    if not os.path.exists(path):
-        return {"sent": {}}
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS notified (
+    item_id       TEXT PRIMARY KEY,
+    first_seen_at TEXT NOT NULL,
+    sent_at       TEXT,
+    deal_score    REAL,
+    title         TEXT
+);
+CREATE INDEX IF NOT EXISTS notified_sent_at ON notified(sent_at);
+"""
+
+
+def db_path() -> str:
+    return os.environ.get("NOTIFY_DB") or DEFAULT_DB_PATH
+
+
+def connect(path: str | None = None) -> sqlite3.Connection:
+    path = path or db_path()
+    if path != ":memory:":
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.executescript(_SCHEMA)
+    _migrate_legacy_json(conn)
+    return conn
+
+
+def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
+    if not os.path.exists(LEGACY_JSON_PATH):
+        return
+    have = conn.execute("SELECT COUNT(*) FROM notified").fetchone()[0]
+    if have:
+        return
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
+        with open(LEGACY_JSON_PATH, "r", encoding="utf-8") as fh:
+            sent = json.load(fh).get("sent", {})
     except (json.JSONDecodeError, OSError):
-        return {"sent": {}}
-    state.setdefault("sent", {})
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_STATE_TTL_DAYS)
-    state["sent"] = {
-        iid: meta
-        for iid, meta in state["sent"].items()
-        if _parse_iso(meta.get("at")) is None or _parse_iso(meta["at"]) >= cutoff
-    }
-    return state
+        return
+    rows = [
+        (iid, meta.get("at") or _utcnow(), meta.get("at") or _utcnow(), meta.get("deal_score"))
+        for iid, meta in sent.items()
+    ]
+    if rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO notified(item_id, first_seen_at, sent_at, deal_score) "
+            "VALUES (?,?,?,?)",
+            rows,
+        )
+        print(f"[i] migrated {len(rows)} item_ids from {LEGACY_JSON_PATH} into the state DB")
 
 
-def _save_state(state: dict, path: str = STATE_PATH) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+def already_sent_ids(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT item_id FROM notified WHERE sent_at IS NOT NULL")}
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
+def claim(conn: sqlite3.Connection, item_id: str, score: float, title: str) -> bool:
+    """Atomically take ownership of sending `item_id`. False => leave it alone."""
+    now = _utcnow()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO notified(item_id, first_seen_at, deal_score, title) "
+        "VALUES (?,?,?,?)",
+        (item_id, now, score, title),
+    )
+    if cur.rowcount == 1:
+        return True
+    row = conn.execute(
+        "SELECT sent_at, first_seen_at FROM notified WHERE item_id=?", (item_id,)
+    ).fetchone()
+    if row is None or row[0] is not None:
+        return False  # already delivered - the guarantee
+    # an unsent claim exists: a concurrent run has it, or a previous run crashed.
+    if _age_seconds(row[1]) < _STALE_CLAIM_SECONDS:
+        return False
+    stolen = conn.execute(
+        "UPDATE notified SET first_seen_at=? WHERE item_id=? AND sent_at IS NULL",
+        (now, item_id),
+    )
+    return stolen.rowcount == 1
+
+
+def mark_sent(conn: sqlite3.Connection, item_id: str) -> None:
+    conn.execute("UPDATE notified SET sent_at=? WHERE item_id=?", (_utcnow(), item_id))
+
+
+def release(conn: sqlite3.Connection, item_id: str) -> None:
+    conn.execute("DELETE FROM notified WHERE item_id=? AND sent_at IS NULL", (item_id,))
+
+
+def prune(conn: sqlite3.Connection, days: int = _PRUNE_AFTER_DAYS) -> None:
+    cutoff = (datetime.now(timezone.utc) - pd.Timedelta(days=days)).isoformat(timespec="seconds")
+    conn.execute("DELETE FROM notified WHERE sent_at IS NOT NULL AND sent_at < ?", (cutoff,))
 
 
 # --- formatting -------------------------------------------------------------
@@ -136,21 +224,24 @@ def _money(value) -> str:
 
 
 def format_deal(row: pd.Series) -> dict:
-    """-> {title, body, tags, priority_hint, url} for one deal."""
+    """-> {title, body, tags, score, url} for one deal."""
     off = ""
     if pd.notna(row.get("discount_pct")):
         off = f" · {row['discount_pct'] * 100:.0f}% under comps"
-
     title = f"{row.get('entity_label', 'car')} — {_money(row.get('price'))}{off}"
 
     bits = [f"comps median {_money(row.get('entity_median'))}"]
     km = row.get("odometer_km")
     if pd.notna(km):
         bits.append(f"{float(km) / 1000:.0f}k km")
+    age = row.get("listing_age_days")
+    if pd.notna(age):
+        bits.append("listed today" if age < 1 else f"listed {age:.0f}d ago")
     if pd.notna(row.get("condition_score")) and abs(row["condition_score"]) >= 0.2:
         bits.append(f"condition {row['condition_score']:+.2f}")
     flags = str(row.get("red_flags") or "").strip()
-    if flags and flags.lower() != "nan":
+    has_flags = bool(flags) and flags.lower() != "nan"
+    if has_flags:
         bits.append(f"flags: {flags.replace(';', ', ')}")
     if row.get("seller_marked_down"):
         bits.append("seller already dropped price")
@@ -159,14 +250,10 @@ def format_deal(row: pd.Series) -> dict:
         bits.append(loc)
     bits.append(f"deal_score {row.get('deal_score', float('nan')):.2f}")
 
-    tags = ["dart"]
-    if flags and flags.lower() != "nan":
-        tags.append("warning")
-
     return {
         "title": title,
         "body": " · ".join(bits),
-        "tags": tags,
+        "tags": ["dart", "warning"] if has_flags else ["dart"],
         "score": float(row.get("deal_score", 0.0) or 0.0),
         "url": str(row.get("url") or ""),
     }
@@ -191,31 +278,33 @@ def _send_ntfy(msg: dict, cfg: dict, high_priority: bool) -> None:
     req = urllib.request.Request(
         endpoint, data=msg["body"].encode("utf-8"), headers=headers, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 - fixed https endpoint
+    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 - fixed http(s) endpoint
         if resp.status >= 300:
             raise RuntimeError(f"ntfy returned HTTP {resp.status}")
 
 
 # --- orchestration -------------------------------------------------------
 
-def pick_new_deals(
-    deals: pd.DataFrame, state: dict, min_score: float, limit: int, ignore_state: bool
+def candidate_deals(
+    deals: pd.DataFrame, done: set[str], min_score: float, limit: int, ignore_state: bool
 ) -> tuple[list[pd.Series], int]:
     df = deals.copy()
     df["item_id"] = df["url"].map(_item_id)
     df = df[df["item_id"].notna() & (df["deal_score"] >= min_score)]
     if not ignore_state:
-        df = df[~df["item_id"].isin(state["sent"])]
-    df = df.sort_values("deal_score", ascending=False)
+        df = df[~df["item_id"].isin(done)]
+    df = df.drop_duplicates("item_id").sort_values("deal_score", ascending=False)
     total = len(df)
     return [row for _, row in df.head(limit).iterrows()], total
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dry-run", action="store_true", help="print, don't send, don't record")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--dry-run", action="store_true", help="print, don't send, don't touch state")
     ap.add_argument("--all", dest="ignore_state", action="store_true",
-                    help="ignore the already-sent state (still won't double-send within this run)")
+                    help="consider deals already notified too (claim() still blocks a true double-send)")
     ap.add_argument("--min-score", type=float, default=None, help="override notifications.min_deal_score")
     ap.add_argument("--limit", type=int, default=None, help="override notifications.max_per_run")
     args = ap.parse_args(argv)
@@ -238,40 +327,56 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     deals = pd.read_csv(DEALS_PATH)
-    state = _load_state()
-    new_deals, total = pick_new_deals(deals, state, min_score, limit, args.ignore_state)
 
-    if not new_deals:
+    if args.dry_run:
+        conn = None
+        done: set[str] = set()
+    else:
+        conn = connect()
+        prune(conn)
+        done = already_sent_ids(conn)
+
+    candidates, total = candidate_deals(deals, done, min_score, limit, args.ignore_state)
+
+    if not candidates:
         print(f"[i] No new deals at deal_score >= {min_score:.2f} "
-              f"({len(deals)} in deals.csv, {len(state['sent'])} already notified).")
+              f"({len(deals)} in deals.csv, {len(done)} already notified).")
         return 0
 
     dest = "" if args.dry_run else f" -> {cfg['server']}/{cfg['topic']}"
     verb = "previewing" if args.dry_run else "sending"
-    print(f"[+] {total} new deal(s) >= {min_score:.2f}; {verb} top {len(new_deals)}{dest}")
+    print(f"[+] {total} candidate deal(s) >= {min_score:.2f}; {verb} up to {len(candidates)}{dest}")
 
-    sent = 0
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for row in new_deals:
+    sent = skipped = errors = 0
+    for row in candidates:
         msg = format_deal(row)
+        item_id = str(row["item_id"])
         high = msg["score"] >= cfg["priority_threshold"]
-        marker = "!!" if high else " ·"
-        print(f"  {marker} {msg['title']}\n       {msg['body']}\n       {msg['url']}")
+        print(f"  {'!!' if high else ' ·'} {msg['title']}\n       {msg['body']}\n       {msg['url']}")
+
         if args.dry_run:
+            continue
+        if not claim(conn, item_id, round(msg["score"], 3), msg["title"]):
+            print("       [i] already notified / claimed elsewhere - skipping")
+            skipped += 1
             continue
         try:
             _send_ntfy(msg, cfg, high)
-        except (urllib.error.URLError, RuntimeError, TimeoutError) as e:
-            print(f"       [!] send failed: {e}", file=sys.stderr)
+        except (urllib.error.URLError, RuntimeError, TimeoutError, OSError) as e:
+            print(f"       [!] send failed, will retry next run: {e}", file=sys.stderr)
+            release(conn, item_id)
+            errors += 1
             continue
-        state["sent"][str(row["item_id"])] = {"at": now, "deal_score": round(msg["score"], 3)}
+        mark_sent(conn, item_id)
         sent += 1
 
     if not args.dry_run:
-        _save_state(state)
-        more = total - len(new_deals)
-        print(f"[+] Sent {sent}/{len(new_deals)}"
-              + (f"; {more} more over the --limit, will go next run" if more > 0 else ""))
+        conn.close()
+        more = total - len(candidates)
+        tail = f"; {more} over --limit (next run)" if more > 0 else ""
+        print(f"[notify] sent={sent} skipped={skipped} errors={errors}{tail}")
+        if errors and not sent:
+            return 1
     return 0
 
 
