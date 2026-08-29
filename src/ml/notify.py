@@ -15,11 +15,15 @@ Reads:  data/processed/deals.csv         (from src.ml.valuation - already filter
                                           of suspects / outliers / dealer ads)
 State:  data/processed/notified.json     item_ids already pushed, so re-runs and
                                           cron don't spam you
-Config: ml_pipeline.notifications in config.yaml
-Auth:   env NTFY_TOKEN  (only for protected or self-hosted topics)
+Config: ml_pipeline.notifications in config.yaml (thresholds, defaults)
+Env:    NTFY_TOPIC   your topic - REQUIRED; overrides config.yaml. This repo is
+                     public, so the real topic goes in a local .env, not a file.
+        NTFY_SERVER  default https://ntfy.sh; set for a self-hosted server
+        NTFY_TOKEN   only for protected / self-hosted topics
+A local .env is auto-loaded if python-dotenv is installed.
 
-Topics on the public ntfy.sh server are unauthenticated - anyone who guesses the
-name can read it. Use a long random topic (see config.yaml) or self-host.
+Topics on the public ntfy.sh server are unauthenticated - anyone who knows the
+name can read it (and post to it). Use a long random topic or self-host.
 """
 from __future__ import annotations
 
@@ -33,6 +37,13 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # pick up NTFY_TOPIC / NTFY_SERVER / NTFY_TOKEN from a local .env
+except ImportError:
+    pass
 
 from src.ml.config import ml_config
 
@@ -57,10 +68,14 @@ _DEFAULTS = {
 def _cfg() -> dict:
     raw = ml_config().get("notifications", {}) or {}
     ntfy = raw.get("ntfy", {}) or {}
+    # env wins over config.yaml - the repo is public, so the real topic lives in
+    # a local .env / the environment, never a committed file.
+    server = os.environ.get("NTFY_SERVER") or ntfy.get("server") or _DEFAULTS["server"]
+    topic = os.environ.get("NTFY_TOPIC") or ntfy.get("topic") or _DEFAULTS["topic"]
     return {
         "enabled": raw.get("enabled", _DEFAULTS["enabled"]),
-        "server": (ntfy.get("server") or _DEFAULTS["server"]).rstrip("/"),
-        "topic": ntfy.get("topic") or _DEFAULTS["topic"],
+        "server": server.rstrip("/"),
+        "topic": topic,
         "min_deal_score": float(raw.get("min_deal_score", _DEFAULTS["min_deal_score"])),
         "priority_threshold": float(
             ntfy.get("priority_threshold", _DEFAULTS["priority_threshold"])
@@ -217,8 +232,9 @@ def main(argv: list[str] | None = None) -> int:
             print("[i] notifications.enabled is false - nothing sent. Use --dry-run to preview.")
             return 0
         if not cfg["topic"] or "changeme" in cfg["topic"]:
-            print("[!] Set a real ml_pipeline.notifications.ntfy.topic in config.yaml first "
-                  "(a long random string), then subscribe the ntfy app to it.", file=sys.stderr)
+            print("[!] No ntfy topic set. Put `NTFY_TOPIC=<a-long-random-string>` in a "
+                  "local .env (or your environment), then subscribe the ntfy app to it.",
+                  file=sys.stderr)
             return 1
 
     deals = pd.read_csv(DEALS_PATH)

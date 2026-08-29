@@ -145,9 +145,17 @@ dedupes across runs so it's cron-safe. High-`deal_score` deals get an elevated
    ```
 
    Sends each fresh `deals.csv` row with `deal_score ≥ min_deal_score` as an
-   [ntfy](https://ntfy.sh) notification — no account, no API key. Set a long
-   random `ml_pipeline.notifications.ntfy.topic` in `config.yaml`, install the
-   ntfy app, and subscribe it to that topic. State in
+   [ntfy](https://ntfy.sh) notification — no account, no API key. Because this
+   repo is public, the topic lives in a local `.env` (gitignored), not
+   `config.yaml`:
+
+   ```bash
+   echo "NTFY_TOPIC=$(python -c 'import secrets;print("auto-sniper-"+secrets.token_urlsafe(18))')" >> .env
+   ```
+
+   Install the ntfy app (iOS / Android / web), add a subscription to that exact
+   topic name on server `ntfy.sh`, and you're done. `NTFY_SERVER` / `NTFY_TOKEN`
+   env vars cover self-hosted or protected topics. State in
    `data/processed/notified.json` means cron / re-runs never double-send;
    `--all` ignores it, `--min-score` / `--limit` override the config.
 
