@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# One full pass of the pipeline: scrape -> entity resolution -> descriptions ->
-# sentiment -> valuation -> notify. Used by .github/workflows/pipeline.yml and
-# runnable locally (`bash scripts/run_once.sh`).
+# One pass of the pipeline: scrape -> observation log -> entity resolution ->
+# descriptions -> sentiment -> valuation -> notify. Used by the GitHub workflows
+# and runnable locally (`bash scripts/run_once.sh`).
+#
+# Entity resolution is INCREMENTAL by default (assign to frozen clusters - the
+# hourly job). The weekly retrain sets FULL_RETRAIN=1 to re-cluster from scratch
+# over the whole accumulated corpus and refresh the model snapshot.
 #
 # Env:
 #   PYTHON              interpreter to use (default: python)
 #   SKIP_SCRAPE=1       reuse existing data/raw, don't hit Facebook
 #   SKIP_DESCRIPTIONS=1 skip the detail-page description scrape
+#   FULL_RETRAIN=1      re-cluster instead of incremental assign (weekly job)
 #   DESC_SINCE          YYYYMMDD floor for fetch_descriptions (default: 4 days ago)
 #   NTFY_TOPIC          required for notify to actually send (see src/ml/notify.py)
 set -euo pipefail
@@ -21,8 +26,16 @@ if [ "${SKIP_SCRAPE:-0}" != "1" ]; then
   "$PY" -m src.scraper.run || echo "[!] scrape failed - continuing on cached data"
 fi
 
-log "entity resolution"
-"$PY" -m src.ml.run_pipeline
+log "observation log"
+"$PY" -m src.ml.observe || echo "[!] observe failed - continuing"
+
+if [ "${FULL_RETRAIN:-0}" = "1" ]; then
+  log "entity resolution (full re-cluster)"
+  "$PY" -m src.ml.run_pipeline
+else
+  log "entity resolution (incremental)"
+  "$PY" -m src.ml.run_pipeline --incremental
+fi
 
 if [ "${SKIP_DESCRIPTIONS:-0}" != "1" ]; then
   log "descriptions"
