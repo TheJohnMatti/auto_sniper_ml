@@ -1,0 +1,22 @@
+# Runtime dependencies for CI / non-poetry installs (the scheduled GitHub Action).
+# Versions are the ones verified in the dev venv; pyproject.toml still carries the
+# poetry-style ranges for local `poetry install`.
+#
+#   pip install -r requirements.txt
+#   python -m playwright install --with-deps chromium
+#
+# For CI, install torch first from the CPU wheel index to avoid the ~2GB CUDA build:
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+
+pandas==3.0.5
+numpy==2.5.2
+scikit-learn==1.9.0
+scipy==1.18.1
+sentence-transformers==6.0.0
+umap-learn==0.5.12
+torch==2.13.0
+beautifulsoup4==4.15.0
+lxml==6.1.2
+playwright==1.62.0
+python-dotenv==1.2.3
+pyyaml==6.0.3

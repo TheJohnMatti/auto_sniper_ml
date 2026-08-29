@@ -45,6 +45,11 @@ ml_pipeline:
     outlier_ratio: 0.25       # price below this * raw median => implausible discount
     outlier_z: -4.0           # ...or robust z at/below this
     project_car_floor: 400    # a severe-flag car (salvage/blown engine) this cheap is a real listing, not an outlier
+    # Staleness: a real steal sells in days. Age comes from the scraped listing
+    # page ("Listed 3 weeks ago") + time since that scrape; unknown age = fresh.
+    max_listing_age_days: 45   # older than this => not a deal, whatever the price
+    stale_steal_days: 14       # ...and a big-discount "steal" older than this...
+    stale_steal_discount: 0.45 # ...(this far under comps) => also stale/junk
 
   notifications:
     # Phone push for fresh deals via ntfy (https://ntfy.sh) - no account/API key.

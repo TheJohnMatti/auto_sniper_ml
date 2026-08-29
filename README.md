@@ -38,10 +38,18 @@ really "make me an offer", finance-payment ads (`$281 bi-weekly`), lease
 buy-ins and rental deposits all read as enormous discounts. `is_outlier` fires
 when the price field clearly isn't the sale price, when it's a keyboard-mash
 placeholder (`$1234` shows up ~46×), or when the discount is too deep to be real
-*and* nothing in the description (salvage, blown engine, …) explains it. Outliers
-stay in `valuation.csv` — the leave-one-out baseline already ignores them and the
-description scrape learns their tells — but are dropped from `deals.csv` and
-notifications.
+*and* nothing in the description (salvage, blown engine, …) explains it.
+
+**Staleness filter:** a genuinely underpriced car sells in days. `is_stale`
+drops any deal that's been listed longer than `max_listing_age_days` (45), or a
+big-discount "steal" still up after two weeks — age comes from the scraped
+listing page (*"Listed 3 weeks ago"*) plus time elapsed since that scrape, so it
+stays honest on re-runs. `deal_score` also carries a mild recency bonus so
+fresh listings rank first.
+
+All three flags stay in `valuation.csv` — the leave-one-out baseline already
+ignores the junk and the description scrape learns its tells — but are dropped
+from `deals.csv` and notifications.
 
 ### Phase 2b: Description Signals
 
@@ -59,9 +67,15 @@ combined `deal_score` and drops dealer/ad posts from the deal list.
 
 `src/ml/notify.py` pushes each fresh `deals.csv` row above a `deal_score`
 threshold to your phone via [ntfy](https://ntfy.sh) (no account / API key — a
-notification is just an HTTP POST to a topic). A local `notified.json` state file
-dedupes across runs so it's cron-safe. High-`deal_score` deals get an elevated
-(louder) priority.
+notification is just an HTTP POST to a topic). High-`deal_score` deals get an
+elevated (louder) priority.
+
+**Exactly-once, cloud-ready:** state is a SQLite DB (`$NOTIFY_DB`, default
+`data/processed/notified.sqlite3`). Each listing goes through a
+claim-before-send handshake against the DB's primary key, so a row once marked
+`sent_at` is **never** sent again — even with overlapping cron runs or a crash
+mid-send (an abandoned claim is reclaimed after an hour; a failed POST is
+released for retry). Point `$NOTIFY_DB` at a mounted volume in a container.
 
 ## 🚀 Getting Started
 
@@ -155,9 +169,51 @@ dedupes across runs so it's cron-safe. High-`deal_score` deals get an elevated
 
    Install the ntfy app (iOS / Android / web), add a subscription to that exact
    topic name on server `ntfy.sh`, and you're done. `NTFY_SERVER` / `NTFY_TOKEN`
-   env vars cover self-hosted or protected topics. State in
-   `data/processed/notified.json` means cron / re-runs never double-send;
-   `--all` ignores it, `--min-score` / `--limit` override the config.
+   env vars cover self-hosted or protected topics. A SQLite state DB
+   (`$NOTIFY_DB`, default `data/processed/notified.sqlite3`) guarantees no
+   listing is ever pushed twice — even under overlapping cron runs; on a
+   container, put it on a persistent volume. `--min-score` / `--limit` override
+   the config; `--dry-run` previews without sending or recording.
 
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
+
+## ☁️ Deployment (scheduled GitHub Action)
+
+`.github/workflows/pipeline.yml` runs the whole chain
+(`scripts/run_once.sh`: scrape → entity resolution → descriptions → sentiment →
+valuation → notify) every 6 hours on a GitHub-hosted runner. The repo is public
+so Actions minutes are free.
+
+**Why not Vercel / a serverless cron:** the pipeline needs `torch` +
+`sentence-transformers` (~1 GB, over Vercel's 250 MB function limit), a real
+Chromium for Playwright, and a persistent disk for the notify state DB — none of
+which serverless provides. A GitHub Action gets a full VM and is itself a cron.
+
+**Setup:**
+
+1. Add the ntfy topic as a repo secret (never commit it — public repo):
+   ```bash
+   gh secret set NTFY_TOPIC        # paste your long random topic
+   gh secret set NTFY_TOKEN        # optional: only for protected / self-hosted
+   ```
+2. Enable Actions for the repo. The schedule starts on its own; use
+   **Run workflow** (`workflow_dispatch`) for a manual run — it has
+   `skip_scrape` / `skip_descriptions` toggles.
+
+**State between runs** lives in the `pipeline-data-*` Actions cache (`data/` —
+raw scrapes, `descriptions.csv`, the embedding cache, and `notified.sqlite3`).
+The cron never idles long enough for the 7-day cache eviction to bite; if it
+does, the next run rebuilds from scratch and may re-notify current deals once.
+`deals.csv` / `valuation.csv` are also uploaded as a run artifact (14 days).
+
+**Caveats:**
+
+- **Facebook may block the runner's datacenter IP** for unauthenticated
+  Marketplace requests. If scrapes come back empty, run the scraper from a
+  residential IP (locally or a small VPS) and let the Action do everything after
+  `--skip-scrape`, or add a proxy.
+- **Label drift:** clustering is re-run each time, so as the listing population
+  churns, cluster ids shift and the curated `data/clusters/label_map.json`
+  gradually stops matching (clusters fall back to the heuristic label). Re-run
+  the `label-clusters` skill and commit a fresh `label_map.json` every few weeks.
