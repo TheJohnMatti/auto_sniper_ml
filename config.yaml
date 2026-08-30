@@ -5,7 +5,7 @@ scraping:
   timeout_ms: 30000
   # Per-run cap for the incremental detail-page description scrape
   # (src/scraper/fetch_descriptions.py). Resumes where it left off each run.
-  description_batch_size: 150
+  description_batch_size: 50   # per ENRICH pass; resumable, so the backlog drains over a few passes
 
   # Where to scrape. Each entry is either:
   #   - a Facebook Marketplace city slug ({slug: windsor}) - only works for the
@@ -60,6 +60,11 @@ ml_pipeline:
     z_threshold: -2.0      # robust z at or below this => flagged as a deal
     min_discount_pct: 0.15 # ...and price must be at least this far below the median
     suspect_ratio: 0.35    # price below suspect_ratio * median => likely junk, not a deal
+    # A blindingly obvious underprice needs fewer comps - so we can alert on a
+    # fresh listing before it sells instead of waiting for the 5th comp.
+    strong_z: -3.0
+    strong_discount: 0.35
+    min_comps_strong: 3
     # "Too good to be true" outlier filter (kept in valuation.csv, dropped from
     # deals.csv + notifications at inference; still trained on).
     outlier_ratio: 0.25       # price below this * raw median => implausible discount
@@ -78,6 +83,7 @@ ml_pipeline:
     enabled: true
     min_deal_score: 0.6       # don't notify below this deal_score
     max_per_run: 10           # cap per invocation; the rest go on the next run
+    max_alert_age_days: 3     # skip deals older than this, or already off the feed (sold)
     ntfy:
       # This repo is PUBLIC - the real topic must NOT live here. Put it in a
       # local .env (gitignored):  NTFY_TOPIC=a-long-random-string

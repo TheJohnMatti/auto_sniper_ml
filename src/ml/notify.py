@@ -82,7 +82,10 @@ _DEFAULTS = {
     "min_deal_score": 0.6,
     "priority_threshold": 0.9,  # deal_score >= this -> high-priority ping
     "max_per_run": 10,
+    "max_alert_age_days": 3,    # a deal older than this is probably gone - don't ping
 }
+
+_OBSERVE_DB = "data/processed/observations.sqlite3"
 
 
 def _cfg() -> dict:
@@ -101,7 +104,33 @@ def _cfg() -> dict:
             ntfy.get("priority_threshold", _DEFAULTS["priority_threshold"])
         ),
         "max_per_run": int(raw.get("max_per_run", _DEFAULTS["max_per_run"])),
+        "max_alert_age_days": float(
+            raw.get("max_alert_age_days", _DEFAULTS["max_alert_age_days"])
+        ),
     }
+
+
+def _still_listed(db_path: str = _OBSERVE_DB) -> set[str] | None:
+    """item_ids seen in the most recent scrape pass and not marked gone. A deal
+    on a listing that's already dropped off the feed is noise - it sold."""
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        latest = con.execute("SELECT MAX(seen_at) FROM observations").fetchone()[0]
+        if not latest:
+            return None
+        # "current" = seen within 90 min of the newest observation (covers a
+        # slow scan cadence) and no gone_at.
+        cutoff = (pd.Timestamp(latest) - pd.Timedelta(minutes=90)).isoformat()
+        rows = con.execute(
+            "SELECT item_id FROM listing_history WHERE gone_at IS NULL AND last_seen >= ?",
+            (cutoff,),
+        ).fetchall()
+        con.close()
+        return {r[0] for r in rows}
+    except sqlite3.Error:
+        return None
 
 
 # --- state store (SQLite) --------------------------------------------------
@@ -223,14 +252,30 @@ def _money(value) -> str:
         return "?"
 
 
+def _norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
 def format_deal(row: pd.Series) -> dict:
     """-> {title, body, tags, score, url} for one deal."""
     off = ""
     if pd.notna(row.get("discount_pct")):
         off = f" · {row['discount_pct'] * 100:.0f}% under comps"
-    title = f"{row.get('entity_label', 'car')} — {_money(row.get('price'))}{off}"
 
-    bits = [f"comps median {_money(row.get('entity_median'))}"]
+    comps = row.get("entity_comps")
+    thin = pd.notna(comps) and comps <= 5
+    marker = "⚠ " if thin else ""
+    title = f"{marker}{row.get('entity_label', 'car')} — {_money(row.get('price'))}{off}"
+
+    bits = []
+    # show the seller's own title when it doesn't obviously match the model we priced it as
+    raw = _norm(row.get("raw_title"))
+    ent = _norm(row.get("entity_label"))
+    ent_model = " ".join(w for w in ent.split() if not w.isdigit())
+    if raw and ent_model and ent_model.split()[-1] not in raw:
+        bits.append(f'listed as "{str(row.get("raw_title")).strip()}"')
+
+    bits.append(f"comps median {_money(row.get('entity_median'))} (n={int(comps) if pd.notna(comps) else '?'})")
     km = row.get("odometer_km")
     if pd.notna(km):
         bits.append(f"{float(km) / 1000:.0f}k km")
@@ -253,7 +298,7 @@ def format_deal(row: pd.Series) -> dict:
     return {
         "title": title,
         "body": " · ".join(bits),
-        "tags": ["dart", "warning"] if has_flags else ["dart"],
+        "tags": ["dart", "warning"] if (has_flags or thin) else ["dart"],
         "score": float(row.get("deal_score", 0.0) or 0.0),
         "url": str(row.get("url") or ""),
     }
@@ -278,7 +323,7 @@ def _send_ntfy(msg: dict, cfg: dict, high_priority: bool) -> None:
     req = urllib.request.Request(
         endpoint, data=msg["body"].encode("utf-8"), headers=headers, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 - fixed http(s) endpoint
+    with urllib.request.urlopen(req, timeout=15) as resp:
         if resp.status >= 300:
             raise RuntimeError(f"ntfy returned HTTP {resp.status}")
 
@@ -286,16 +331,29 @@ def _send_ntfy(msg: dict, cfg: dict, high_priority: bool) -> None:
 # --- orchestration -------------------------------------------------------
 
 def candidate_deals(
-    deals: pd.DataFrame, done: set[str], min_score: float, limit: int, ignore_state: bool
-) -> tuple[list[pd.Series], int]:
+    deals: pd.DataFrame, done: set[str], min_score: float, limit: int, ignore_state: bool,
+    max_age_days: float = 3.0,
+) -> tuple[list[pd.Series], int, int]:
     df = deals.copy()
     df["item_id"] = df["url"].map(_item_id)
     df = df[df["item_id"].notna() & (df["deal_score"] >= min_score)]
     if not ignore_state:
         df = df[~df["item_id"].isin(done)]
+
+    # Freshness: a deal you can't act on is worse than no deal. Drop listings
+    # that are too old, or that have already dropped off the feed (sold).
+    before = len(df)
+    if "listing_age_days" in df.columns:
+        age = pd.to_numeric(df["listing_age_days"], errors="coerce")
+        df = df[age.isna() | (age <= max_age_days)]
+    live = _still_listed()
+    if live is not None:
+        df = df[df["item_id"].isin(live)]
+    stale_dropped = before - len(df)
+
     df = df.drop_duplicates("item_id").sort_values("deal_score", ascending=False)
     total = len(df)
-    return [row for _, row in df.head(limit).iterrows()], total
+    return [row for _, row in df.head(limit).iterrows()], total, stale_dropped
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -336,11 +394,14 @@ def main(argv: list[str] | None = None) -> int:
         prune(conn)
         done = already_sent_ids(conn)
 
-    candidates, total = candidate_deals(deals, done, min_score, limit, args.ignore_state)
+    candidates, total, stale_dropped = candidate_deals(
+        deals, done, min_score, limit, args.ignore_state, cfg["max_alert_age_days"]
+    )
 
     if not candidates:
-        print(f"[i] No new deals at deal_score >= {min_score:.2f} "
-              f"({len(deals)} in deals.csv, {len(done)} already notified).")
+        extra = f", {stale_dropped} dropped as stale/gone" if stale_dropped else ""
+        print(f"[i] No fresh deals at deal_score >= {min_score:.2f} "
+              f"({len(deals)} in deals.csv, {len(done)} already notified{extra}).")
         return 0
 
     dest = "" if args.dry_run else f" -> {cfg['server']}/{cfg['topic']}"
