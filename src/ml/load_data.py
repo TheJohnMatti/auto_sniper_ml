@@ -93,6 +93,21 @@ def load_raw_listings(raw_glob: str = RAW_GLOB) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
+    # --- drop non-cars ---------------------------------------------------------
+    # The vehicles feed is full of motorcycles / boats / trailers / equipment.
+    # Pricing those against cars invents fake deals (see src/ml/vehicle_type.py).
+    from src.ml.vehicle_type import _load_curated, is_priceable
+
+    curated = _load_curated()
+    keep = [
+        is_priceable(iid, title, curated)
+        for iid, title in zip(listings["item_id"], listings["raw_title"])
+    ]
+    dropped = len(listings) - sum(keep)
+    listings = listings[keep].reset_index(drop=True)
+    if dropped:
+        print(f"[i] dropped {dropped} non-car listings (motorcycle/boat/trailer/equipment)")
+
     # --- normalized text for embedding ----------------------------------------
     listings["title_clean"] = (
         listings["raw_title"].str.lower().str.replace(r"\s+", " ", regex=True).str.strip()

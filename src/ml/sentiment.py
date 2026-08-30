@@ -93,10 +93,30 @@ PRICE_NOT_SALE = {
 
 _CONTACT_ONLY = re.compile(r"^[\s\d.,+()-]*(?:call|text|phone|for more info(?:rmation)?|contact)?[\s\d.,+()x-]*$", re.I)
 
+# A negation within ~45 chars *before* a red-flag keyword cancels it:
+# "never been in an accident", "no rust", "not a salvage title".
+_NEGATION_BEFORE = re.compile(
+    r"\b(no|not|never|without|zero|free\s+of|free\s+from|"
+    r"don'?t|doesn'?t|didn'?t|hasn'?t|haven'?t|isn'?t|wasn'?t|ain'?t)\b"
+    r"[\w\s,'\"-]{0,45}$",
+    re.I,
+)
+
 
 def _count_hits(text: str, lexicon: dict[str, str]) -> tuple[int, list[str]]:
     hits = [label for label, pat in lexicon.items() if re.search(pat, text, re.I)]
     return len(hits), hits
+
+
+def _drop_negated(text: str, flags: list[str], lexicon: dict[str, str]) -> list[str]:
+    """Remove red flags whose keyword is preceded by a negation."""
+    kept = []
+    for label in flags:
+        m = re.search(lexicon[label], text, re.I)
+        if m and _NEGATION_BEFORE.search(text[max(0, m.start() - 45):m.start()]):
+            continue
+        kept.append(label)
+    return kept
 
 
 def _load_descriptions(path: str = DESCRIPTIONS_PATH) -> pd.DataFrame:
@@ -130,7 +150,9 @@ def score_descriptions(df: pd.DataFrame, now: datetime | None = None) -> pd.Data
         n_ad, ad = _count_hits(text, DEALER_OR_AD)
         n_notsale, notsale = _count_hits(text, PRICE_NOT_SALE)
 
-        # "no rust" / "no accidents" trip both lexicons - the assurance wins.
+        # kill red flags that are actually negated ("never been in an accident")
+        red = _drop_negated(text, red, RED_FLAGS)
+        # ...and the assurance still wins if both somehow fired.
         for assurance, flag in (("no_rust", "rust"), ("no_accidents", "accident_damage")):
             if assurance in pos and flag in red:
                 red.remove(flag)

@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # One pass of the pipeline: scrape -> observation log -> entity resolution ->
-# descriptions -> sentiment -> valuation -> notify. Used by the GitHub workflows
-# and runnable locally (`bash scripts/run_once.sh`).
+# descriptions -> sentiment -> valuation -> notify.
 #
-# Entity resolution is INCREMENTAL by default (assign to frozen clusters - the
-# hourly job). The weekly retrain sets FULL_RETRAIN=1 to re-cluster from scratch
-# over the whole accumulated corpus and refresh the model snapshot.
+# Two schedules share this script (see scripts/local-cron.sh):
+#   SCAN   (every ~5 min)  SKIP_DESCRIPTIONS=1 - scrape the feed, score, notify.
+#                          Fast (~30s once the embedding cache is warm) so a
+#                          fresh deal gets pinged before it sells.
+#   ENRICH (every ~20 min) SKIP_SCRAPE=1 - fetch detail-page descriptions for
+#                          recent listings, then re-score so newly-described
+#                          listings get their shot. Slower.
+# The weekly retrain sets FULL_RETRAIN=1 to re-cluster from scratch.
 #
 # Env:
 #   PYTHON              interpreter to use (default: python)
 #   SKIP_SCRAPE=1       reuse existing data/raw, don't hit Facebook
 #   SKIP_DESCRIPTIONS=1 skip the detail-page description scrape
 #   FULL_RETRAIN=1      re-cluster instead of incremental assign (weekly job)
-#   DESC_SINCE          YYYYMMDD floor for fetch_descriptions (default: 4 days ago)
+#   DESC_SINCE          YYYYMMDD floor for fetch_descriptions (default: 2 days ago)
 #   NTFY_TOPIC          required for notify to actually send (see src/ml/notify.py)
 set -euo pipefail
 
@@ -55,7 +59,7 @@ fi
 
 if [ "${SKIP_DESCRIPTIONS:-0}" != "1" ]; then
   log "descriptions"
-  since="${DESC_SINCE:-$(date -u -d '4 days ago' +%Y%m%d 2>/dev/null || date -u -v-4d +%Y%m%d)}"
+  since="${DESC_SINCE:-$(date -u -d '2 days ago' +%Y%m%d 2>/dev/null || date -u -v-2d +%Y%m%d)}"
   "$PY" -m src.scraper.fetch_descriptions --deals "--since=${since}" || \
     echo "[!] description scrape failed - continuing"
 fi

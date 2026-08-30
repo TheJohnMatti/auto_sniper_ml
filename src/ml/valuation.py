@@ -34,12 +34,47 @@ Outputs:
     data/processed/deals.csv       just the flagged underpriced listings, best first
 """
 import os
+import re
 
 import numpy as np
 import pandas as pd
 
 from src.ml.config import ml_config
 from src.ml.mileage import adjust_prices, fit_km_slope
+
+# Make tokens that carry no model info on their own (too many Hondas to verify a
+# listing by "honda" alone). Aliases map to the canonical make.
+_MAKE_TOKENS = {
+    "honda", "toyota", "ford", "chevrolet", "chevy", "gmc", "nissan", "mazda",
+    "hyundai", "kia", "volkswagen", "vw", "bmw", "mercedes", "benz",
+    "mercedes-benz", "audi", "subaru", "lexus", "acura", "infiniti", "dodge",
+    "jeep", "ram", "chrysler", "buick", "cadillac", "tesla", "volvo", "mini",
+    "mitsubishi", "fiat", "porsche", "jaguar", "land", "rover", "genesis",
+    "lincoln", "pontiac", "saturn", "scion", "suzuki", "the",
+}
+
+
+def _title_matches_label(title: str, label: str) -> bool:
+    """Does the listing's own title name the model it was assigned to?
+
+    Guards against nearest-centroid misassignment ("2018 honda cbr" -> the
+    "Honda Accord" cluster). Conservative: when the label carries no verifiable
+    model token, allow it.
+    """
+    if not isinstance(label, str) or not label or label.upper() == "UNKNOWN":
+        return True
+    if not isinstance(title, str):
+        return False
+    t = re.sub(r"\b(?:19|20)\d\d\b", " ", re.sub(r"[^a-z0-9 ]", " ", title.lower()))
+    tokens = set(t.split())
+    squashed = t.replace(" ", "")
+    model_toks = [
+        w for w in re.sub(r"[^a-z0-9 ]", " ", label.lower()).split()
+        if w not in _MAKE_TOKENS and len(w) >= 2
+    ]
+    if not model_toks:
+        return True
+    return any(w in tokens or w in squashed for w in model_toks)
 
 LABELED_PATH = "data/processed/listings_labeled.pkl"
 SIGNALS_PATH = "data/processed/listing_signals.csv"
@@ -95,6 +130,10 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     min_discount_pct = float(cfg.get("min_discount_pct", 0.15))
     suspect_ratio = float(cfg.get("suspect_ratio", 0.35))
 
+    strong_z = float(cfg.get("strong_z", -3.0))
+    strong_discount = float(cfg.get("strong_discount", 0.35))
+    min_comps_strong = int(cfg.get("min_comps_strong", 3))
+
     # Only listings we can actually value: real canonical model, a parsed year,
     # a positive price.
     scored = df[
@@ -103,6 +142,15 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
         & (df["year"].notna())
         & (df["price"] > 0)
     ].copy()
+
+    # --- title <-> assigned-label consistency --------------------------------
+    # The frozen cluster model assigns each listing to its nearest centroid; a
+    # "2018 honda cbr" lands in the "Honda Accord" cluster and gets priced as a
+    # car. Require the listing's own title to name the model it was assigned to.
+    scored["label_mismatch"] = [
+        not _title_matches_label(t, lab)
+        for t, lab in zip(scored["raw_title"], scored["canonical_label"])
+    ]
 
     # --- mileage adjustment: restate every price to a reference odometer -------
     odo = _odometer_by_item()
@@ -116,7 +164,7 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     bad_odo = scored["odometer_km"].notna() & (
         (scored["odometer_km"] < 1_000)
         | (scored["odometer_km"] > 500_000)
-        | ((age >= 4) & (scored["odometer_km"] < age * 1_500))
+        | ((age >= 4) & (scored["odometer_km"] <= age * 2_000))  # sustained <2k km/yr: dropped digit
     )
     scored.loc[bad_odo, "odometer_km"] = np.nan
 
@@ -135,13 +183,22 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     scored["discount_pct"] = 1.0 - scored["mileage_adj_price"] / scored["entity_adj_median"]
     scored["raw_discount_pct"] = 1.0 - scored["price"] / scored["entity_median"]
 
-    enough = scored["entity_comps"] >= min_comps
-    scored["is_suspect"] = enough & (scored["price"] < suspect_ratio * scored["entity_median"])
+    # A blindingly obvious underprice needs less corroboration than a marginal
+    # one - drop the comp bar for those so we can alert on the fresh listing
+    # before it sells, instead of waiting hours for the 5th comp to show up.
+    strong = (scored["robust_z"] <= strong_z) & (scored["discount_pct"] >= strong_discount)
+    enough = (scored["entity_comps"] >= min_comps) | (
+        strong & (scored["entity_comps"] >= min_comps_strong)
+    )
+    scored["is_suspect"] = (scored["entity_comps"] >= min_comps) & (
+        scored["price"] < suspect_ratio * scored["entity_median"]
+    )
     scored["is_deal"] = (
         enough
         & (scored["robust_z"] <= z_threshold)
         & (scored["discount_pct"] >= min_discount_pct)
         & ~scored["is_suspect"]
+        & ~scored["label_mismatch"]
     )
     # Corroborating signal: the seller already marked it down.
     scored["seller_marked_down"] = scored["price_original"].notna() & (
@@ -283,12 +340,12 @@ def main() -> None:
     scored = attach_signals(score_listings(df))
 
     cols = [
-        "entity_label", "price", "entity_median", "mileage_adj_price",
+        "entity_label", "raw_title", "price", "entity_median", "mileage_adj_price",
         "odometer_km", "mileage_known", "listing_age_days", "discount_pct",
         "raw_discount_pct", "robust_z", "entity_comps", "deal_score", "is_deal",
-        "is_suspect", "is_outlier", "is_stale", "in_region", "seller_marked_down",
-        "has_description", "condition_score", "urgency_score", "red_flags",
-        "is_dealer_or_ad", "price_not_sale_cues", "raw_price_original",
+        "is_suspect", "is_outlier", "is_stale", "label_mismatch", "in_region",
+        "seller_marked_down", "has_description", "condition_score", "urgency_score",
+        "red_flags", "is_dealer_or_ad", "price_not_sale_cues", "raw_price_original",
         "location", "raw_listing_location", "url",
     ]
     cols = [c for c in cols if c in scored.columns]
