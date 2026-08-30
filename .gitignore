@@ -21,6 +21,7 @@ data/clusters/
 !data/clusters/
 data/clusters/*
 !data/clusters/label_map.json
+!data/clusters/vehicle_type.json
 
 # Python Cache
 __pycache__/
