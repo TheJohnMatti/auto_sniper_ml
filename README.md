@@ -178,6 +178,36 @@ released for retry). Point `$NOTIFY_DB` at a mounted volume in a container.
 > **Note:** if `poetry` is not on your PATH, call the project virtualenv's
 > interpreter directly (`poetry env info -p` prints its location).
 
+## 🙋 Human-in-the-loop curation via `interject`
+
+Two steps in this pipeline need a human judgment the code cannot make: which
+canonical `Make Model` a cluster represents, and what kind of vehicle an
+ambiguous listing is. Historically each was a bespoke request/response file pair
+serviced by an agent skill (`label-clusters`, `classify-vehicle`).
+
+`scripts/interject_curate.py` is an alternative path for both, built on
+[interject](https://github.com/TheJohnMatti/interject). Open cases become
+questions you answer from anywhere — phone, CLI, web — and the answers are merged
+back into the same curated maps the pipeline already reads
+(`data/clusters/label_map.json`, `data/clusters/vehicle_type.json`). Nothing
+downstream changes.
+
+It never blocks. Each run merges whatever has been answered since last time and
+registers up to `--limit` new questions, so it is safe to call from a scheduled
+job while answers accumulate at human pace.
+
+```bash
+uv pip install -e ~/code/interject/python     # not on PyPI yet
+export INTERJECT_URL=http://127.0.0.1:8787
+export INTERJECT_PROJECT=auto_sniper
+
+python scripts/interject_curate.py cluster-label --limit 25
+python scripts/interject_curate.py vehicle-type --limit 25
+```
+
+Entirely opt-in: the skills and their request files still work, and nothing in
+the scheduled pipeline calls this unless you add it.
+
 ## ☁️ Deployment
 
 The scrape **must originate from a residential IP.** Facebook serves an
