@@ -32,6 +32,32 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
+# A run that hangs holds the lock forever, and every scheduled run after it sees
+# the lock and exits silently. That happened for three days in September 2026:
+# playwright's client/driver connection died while the laptop slept, and because
+# playwright enforces its timeouts inside the driver, nothing fired. 2,765 no-op
+# runs, no alerts, no error. So cap the wall clock here, where nothing can
+# outlive it: the watchdog TERMs this shell, the EXIT trap releases the lock, and
+# the next scheduled run gets a clean start.
+# The weekly FULL_RETRAIN re-embeds and re-clusters everything and legitimately
+# runs for many minutes, so it gets a far longer rope than a 5-minute scan. A cap
+# that kills honest work is worse than no cap at all.
+if [ "${FULL_RETRAIN:-0}" = "1" ]; then
+  MAX_RUNTIME="${MAX_RUNTIME:-7200}"
+else
+  MAX_RUNTIME="${MAX_RUNTIME:-900}"
+fi
+if [ "$MAX_RUNTIME" -gt 0 ]; then
+  ( sleep "$MAX_RUNTIME"
+    if kill -0 "$$" 2>/dev/null; then
+      echo "[!] run exceeded ${MAX_RUNTIME}s - killing it so the lock is released" >&2
+      kill -TERM "$$" 2>/dev/null || true
+    fi
+  ) &
+  WATCHDOG=$!
+  trap 'kill "$WATCHDOG" 2>/dev/null || true; rmdir "$LOCK" 2>/dev/null || true' EXIT
+fi
+
 log() { printf '\n=== %s ===\n' "$1"; }
 
 if [ "${SKIP_SCRAPE:-0}" != "1" ]; then
@@ -72,3 +98,14 @@ log "valuation"
 
 log "notify"
 "$PY" -m src.ml.notify
+
+# Report that a full pass completed. A hang never reaches this line, so silence
+# past the interval is itself the alert - the failure above would have announced
+# itself the same evening instead of being found three days later.
+# Opt-in: without INTERJECT_URL this is a no-op and nothing changes.
+if [ -n "${INTERJECT_URL:-}" ]; then
+  "$PY" - <<'HEARTBEAT' || echo "[i] heartbeat failed (is interjectd running?)"
+import interject
+interject.heartbeat("autosniper.scan", expect_every="20m")
+HEARTBEAT
+fi

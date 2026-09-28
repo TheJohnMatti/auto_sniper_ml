@@ -193,12 +193,20 @@ def score_listings(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     scored["is_suspect"] = (scored["entity_comps"] >= min_comps) & (
         scored["price"] < suspect_ratio * scored["entity_median"]
     )
+    # A human has told us this cluster is not one vehicle (see
+    # scripts/interject_watch.py). Its median is therefore meaningless, and a
+    # discount measured against it is noise dressed up as a number, so nothing
+    # in it may become a deal.
+    scored["unpriceable"] = scored["entity_label"].str.contains(
+        r"\bMIXED\b", na=False, regex=True
+    )
     scored["is_deal"] = (
         enough
         & (scored["robust_z"] <= z_threshold)
         & (scored["discount_pct"] >= min_discount_pct)
         & ~scored["is_suspect"]
         & ~scored["label_mismatch"]
+        & ~scored["unpriceable"]
     )
     # Corroborating signal: the seller already marked it down.
     scored["seller_marked_down"] = scored["price_original"].notna() & (
@@ -370,6 +378,10 @@ def main() -> None:
     print(f"[+] {len(deals)} deals, {int(scored['is_suspect'].sum())} suspect, "
           f"{int(scored['is_outlier'].sum())} outlier (too good to be true), "
           f"{int(scored['is_stale'].sum())} stale (on market too long)")
+    n_unpriceable = int(scored["unpriceable"].sum())
+    if n_unpriceable:
+        print(f"[+] {n_unpriceable} listings in clusters a human marked MIXED; "
+              f"excluded from deals because their entity median is meaningless")
     print(f"[+] {int(scored['in_region'].sum())}/{len(scored)} listings in region; "
           f"deals outside the region are dropped ({int((~scored['in_region']).sum())} excluded)")
     print(f"[+] Wrote {valuation_path} and {deals_path}")
