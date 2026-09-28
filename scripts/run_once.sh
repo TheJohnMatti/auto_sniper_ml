@@ -39,7 +39,14 @@ trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 # runs, no alerts, no error. So cap the wall clock here, where nothing can
 # outlive it: the watchdog TERMs this shell, the EXIT trap releases the lock, and
 # the next scheduled run gets a clean start.
-MAX_RUNTIME="${MAX_RUNTIME:-900}"
+# The weekly FULL_RETRAIN re-embeds and re-clusters everything and legitimately
+# runs for many minutes, so it gets a far longer rope than a 5-minute scan. A cap
+# that kills honest work is worse than no cap at all.
+if [ "${FULL_RETRAIN:-0}" = "1" ]; then
+  MAX_RUNTIME="${MAX_RUNTIME:-7200}"
+else
+  MAX_RUNTIME="${MAX_RUNTIME:-900}"
+fi
 if [ "$MAX_RUNTIME" -gt 0 ]; then
   ( sleep "$MAX_RUNTIME"
     if kill -0 "$$" 2>/dev/null; then
